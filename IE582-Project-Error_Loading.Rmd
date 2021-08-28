@@ -1,0 +1,438 @@
+---
+title: "Project Report IE 582"
+author: "Error_Loading"
+date: "1/26/2021"
+output: 
+  html_document:
+      toc: true
+      toc_depth: 3
+      number_sections: true
+      code_folding: hide
+          
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, conflict=FALSE, warning=FALSE, message=FALSE, error = FALSE, comment = FALSE)
+```
+
+# Introduction and Problem Definition
+
+```{r libraries}
+library(caret)
+library(dplyr)
+library(corrplot)
+library(data.table)
+library(glmnet)
+library(TunePareto)
+library(randomForest)
+library(tidyverse)
+library(ggplot2)
+library(pROC)
+library(skimr)
+```
+First we import the required libraries. 
+
+```{r dataset}
+train_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTrain.csv?token=ARPECO5RVGUHXHQVPPYNA3DAF7PTU")
+test_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTest.csv?token=ARPECO77ESBHNVKCT2Q2PKTAF7PTA")
+```
+Then we import the datasets given for this project. Here we have separate train and test sets, we call them `train_raw` and `test_raw`. Our aim is to find a binary classification model using train set and make predictions on test set. Then we will submit our predictions and see whether the model is working well or not.  
+
+```{r characteristics}
+glimpse(train_raw)
+skim(train_raw)
+skim(test_raw)
+
+colns <- colnames(train_raw)
+cts_features <- c("x1", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x14", "x27", "x30", "x32", "x36", "x42")
+categorical_features <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35",  "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x58", "x59", "x60")
+categorical_features_y <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x58", "x59", "x60", "y")
+
+# train x50 ve x52 zero column, no variation, nothing to learn
+# test x50 ve x52 not zero but cannot predict if not learned
+#so drop them
+train <- train_raw %>% select(-x50, -x52, -x57, -x37)
+X_test_submission <- test_raw %>% select(-x50, -x52, -x37, -x57, -y)
+
+```
+
+Using glimpse and skim functions on the train set, we see the characteristics of the features. Skim function shows that there are no missing values in both train and test set, this is good since NA values may create problems in some models. Train set has the feature columns and the target column but the test set does not have the target column. Therefore, the only way to understand if a model is good or not before making any submission is to use train set as the only data we are given. In other words, we will use train data to create train-test split.
+
+We have `r length(colns)-1` features in total where `r length(cts_features)` of them are continuous and `r length(colns)-1-length(cts_features)` of them are categorical. Skim function shows that continuous features are in different ranges. So they should be scaled. Categorical features are all binary. Also features x50 and x52 have zero standard deviation in the train set. When we look at the values, they are all zero for all the instances in the train set. This means that whichever model is used, it is not possible to learn any information from these two features. Therefore it could be wise to eliminate them in both train and test sets. 
+
+Looking at `X_test_submission`, we see that features x37 and x57 has zero variance. This means even if we learn something from them, their effect will not be significant. We have also seen that they are the less important features according to impurity measure on random forest. Therefore we remove them at the beginning. 
+
+```{r imbalance}
+class_dist<-train_raw %>% group_by(y) %>% summarize(count=n()) 
+ggplot(train_raw, aes(x=y)) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7))
+```
+
+Since this is a binary classification problem, we would like to see the percentages of each class in the target. The classes are called "a" and "b", where there are `r class_dist[1,2]` many a's and `r class_dist[2,2]` many b's. So nearly `r round(100*class_dist[1,2]/(class_dist[1,2]+class_dist[2,2]),0)`% of the data has target value "a". Therefore, the problem is an imbalanced classification problem which needs to be fixed. 
+
+Imbalanced data should be manipulated since prediction models tend to predict target values as the majority class. There are many methods to overcome imbalanced data. Although we use three different methods, we had expected oversampling would give best results. The reasoning of this, train and test data observations have few instances of class "b". Using undersampling may result information loss such as zero standard deviation. This method mainly used on the data which has huge number of instances. Therefore, generating some instances of the minority class would be beneficial for the implementation of codes.
+
+Our approach is to first dealing with imbalance problem and then perform Random Forest - Ranger classifier in order to see the importance levels of the features with respect to the permutation method. This will help us to decide on which features to remove from the model. After feature elimination, we will fit the model on the whole train data and make predictions on the submission data.
+
+# Literature Review
+
+**Class Imbalance in Classification Problem** 
+
+Class imbalance is the situation where a class of predicted variable is significantly higher than the other one/s. In binary classification case, the class with higher number of observations is called “majority class” and the other is called “minority class.” This is a common problem in real life data where a class may naturally dominate the other ones, or it may be a result of biased sampling or measurement errors (Brownlee, 2019). This class imbalance problem has to be dealt in order Machine Learning algorithms to perform better on balanced prediction accuracy.
+There are various methods to deal with class imbalance and the ones considered in this study are over-sampling, under-sampling and Synthetic Minority Over-sampling Technique (SMOTE). Each of these methods follows a different approach to balance the number of observations among classes (Barandela et al., 2004).
+
+**Over-sampling** 
+
+Over-sampling is basically replicating observations from the minority class using different methods. Using Nearest Neighbor approach on the minority data, an amount of artificial observations is created and added to the dataset in order to balance the class distributions (Barandela et al., 2004). Creation of new data can be done randomly or by “informative sampling” using  “pre-defined criterion” to obtain new data for the minority class.
+One great advantage of over-sampling is that no data is lost, so there will not be any loss of information due to data removed. On the other hand, obtaining new observations from the minority data by replicating them following a pattern may cause overfitting (“Analytics Vidhya”, 2016). These advantage and disadvantage have to be discussed thoroughly before implementing the method.
+
+We will use Synthetic Minority Over-sampling Technique (SMOTE) function from “smotefamily” package in order to implement this method in R.
+
+**Under-sampling** 
+
+Under-sampling is again basically removing observations from the majority class in order to balance the class distributions in the dataset. Removing observations from the original data eventually causes loss of information so there are some algorithms developed to reduce the loss of significant information while removing samples from the data. Wilson’s Editing, Weighted Editing and The Modified Selective Subsets are some algorithms focusing on removing the observations with minimum loss of significant information (Barandela et al., 2004).
+One important disadvantage of under-sampling is loss of information and training the model with less data. This may lead to lower accuracy of prediction in the final predictive model. “ovun.sample()” function in “ROSE” package can be used to implement both over- and under- sampling in R.
+
+
+**Mixture of Over-Sampling and Under-Sampling** 
+
+SMOTE from DMwR package is a method which integrates the previously discussed methods, over-sampling and under-sampling. The majority class is under-sampled, and the minority class is over-sampled to a level which optimizes the loss of information and overfitting. SMOTE from DMwR proposes an over-sampling approach of creating “synthetic” instead of over-sampling by replacement (Chawla et al., 2002). Chawla et al. states that this approach gives better ROC results in various datasets (2002). But this may still lead to information loss.
+
+# Approach
+
+```{r deal-imbalance}
+# make all colns double for smote
+train_y <- mlr::createDummyFeatures(train$y, train$y,  method="reference")
+trainx <- train %>% select(-y)
+train <- cbind(as.data.table(trainx), as.data.table(train_y)) %>% rename(y=b)
+
+set.seed(70)
+smote <- smotefamily::SMOTE(X=train, target=train$y, K=1, dup_size = 2)
+
+final_train_smote <- smote[["data"]] %>% select(-class)
+class_dist2 <- final_train_smote %>% group_by(y) %>% summarize(count=n()) 
+
+final_train_smote$y[final_train_smote$y==1] <- "b"
+final_train_smote$y[final_train_smote$y==0] <- "a"
+```
+
+In order to use `SMOTE` function from `smotefamily` package, we map the target column to 0-1 from a-b. We do this by creating dummies. Then we use `SMOTE` to increase the instances from the minority class and make the data balanced. We observe that there are `r class_dist2[1,2]` many a's and `r class_dist2[2,2]` many b's. The number of instances from each class are very close, so the imbalance problem is fixed. Then we map 0-1's to a-b in order to avoid possible errors with Random Forest Classifier. 
+
+
+```{r scaling_factorization}
+# scaling
+train_cts_scaled <- final_train_smote %>% select(-y) %>% select(cts_features) %>% scale() %>% as.data.frame()
+
+X_test_cts_scaled <-X_test_submission %>% select(cts_features) %>% scale() %>% as.data.frame()
+
+# factorization
+train_categorical <- final_train_smote %>% select(categorical_features)
+train_categorical <- lapply(train_categorical, factor)
+X_test_submission_categorical <- X_test_submission %>% select(categorical_features)
+X_test_submission_categorical <- lapply(X_test_submission_categorical, factor)
+
+train_categorical <- final_train_smote %>% select(categorical_features)
+
+X_test_submission_categorical <- X_test_submission %>% select(categorical_features)
+
+# scaled and factored
+trainn <- cbind(as.data.table(train_cts_scaled), as.data.table(train_categorical), as.data.table(final_train_smote$y)) %>% rename(y=V1)
+trainn$y <- as.factor(trainn$y)
+final_train <- trainn
+X_test_submission <- cbind(as.data.table(X_test_cts_scaled), as.data.table(X_test_submission_categorical))
+```
+
+In order to treat continuous and categorical features differently, we created separate dataframes. Since some of the features are continuous, we normalized them using `scale` function. We also have binary categorical features that need to be factorized. Then we binded the dataframes back. This procedure is done for both train and test feature datasets. 
+
+```{r corr}
+#Correlation check
+corrplot(cor(train_cts_scaled, method = c("pearson")))
+corrplot(cor(X_test_cts_scaled, method = c("pearson")))
+```
+
+Correlation makes sense only for the continuous features. Here we see that, none of the continuous variables are significantly correlated. As a result, we do not remove any of the continuous variables from the train data.
+
+```{r model_for_features, include = FALSE}
+set.seed(50)
+#results="hide"
+J<-500 
+n_folds<-10
+rf_grid<-expand.grid(.mtry=c(3,5,10,15), .splitrule = "gini", .min.node.size = 5)
+fitControl<-trainControl(method = "repeatedcv", number = n_folds, repeats = 1, verboseIter = TRUE, classProbs = TRUE, 
+                         search="random", savePred=TRUE, summaryFunction = twoClassSummary)   
+
+set.seed(50)
+model_RF <- train(y ~ ., data = trainn, method = "ranger", trControl = fitControl, num.trees=J, tuneGrid = rf_grid, 
+                  metric="ROC", importance="permutation")
+
+cm_pra_train <- confusionMatrix(factor(predict(model_RF, newdata=trainn[,-57])), factor(trainn$y))
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+
+a <- model_RF[["finalModel"]][["variable.importance"]] %>% as.data.frame()
+colnames(a)[1] = "Importance"
+a <- a %>% arrange(Importance)
+print(a)
+```
+
+```{r important-feat}
+a <- model_RF[["finalModel"]][["variable.importance"]] %>% as.data.frame()
+colnames(a)[1] = "Importance"
+a <- a %>% arrange(desc(Importance)) %>% tail(10)
+print(a)
+```
+
+We would like to use permutation based importance since it accounts for noisy data better and multiple permutation trials are better than single shuffle. Recall that due to shuffling, processing is not simultaneous. 
+We used Ranger Classifier in order to see the permutation based importance of the features. It gives `r round(balanced_accuracy_train*100,2)`% on train data. We order the features according to their permutation based importance and decide to eliminate last 10 least important ones from our models.
+
+Then we repeat the same procedure for Random Forest model.
+
+```{r model-selection}
+trainn <- final_train %>% select(-x59, -x26, -x49, -x46, -x43, -x60, -x29, -x55, -x31, -x18)
+```
+
+We update our train set by removing the least important features. 
+
+```{r split}
+set.seed(1)
+train_inds <- createDataPartition(y = 1:nrow(trainn), p = 0.8, list = F)
+test <- trainn[-train_inds, ]
+train <- trainn[train_inds, ]
+
+train <- train
+X_train <- train %>% select(-y)
+y_train <- train %>% select(y)
+X_test <- test %>% select(-y)
+y_test <- test %>% select(y)
+```
+
+Now, we need to split train data into train-test. We select 80% indices randomly from the given train set by `createDataPartition` function from `caret` library. We use these indices to form sub-train and the remaining 20% will form sub-test. 
+
+Then our approach is to train a model on `sub-train` and test it on `sub-test` to decide if it is generalizing. If we believe that the model is good enough, then we fit a model on the actual train set and test it on the submission data. 
+
+
+```{r random-forest}
+set.seed(50)
+n_folds <- 10
+fitControl <- trainControl(method = "repeatedcv", number = n_folds, repeats = 3, classProbs = TRUE, search="random", savePred=TRUE, summaryFunction = twoClassSummary)   
+rf_grid<-expand.grid(mtry = c(8, 10, 12))
+
+model_RF <- train(y ~ ., data = train, method = "rf", trControl = fitControl, ntree=500, nodesize = 5, tuneGrid = rf_grid, metric = "ROC")
+
+pred_RF <- predict(model_RF, newdata=X_test)
+
+cm_RF_test <- confusionMatrix(factor(pred_RF), factor(test$y))
+cm_RF_train <- confusionMatrix(factor(predict(model_RF, newdata=X_train)), factor(train$y))
+
+balanced_accuracy_test <- cm_RF_test[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_train <- cm_RF_train[["byClass"]][["Balanced Accuracy"]]
+```
+
+
+We perform 10-Fold Cross-Validation repeated 3 times. 
+We set the minimal number of observations per tree leaf (nodesize) to be 5, number of trees (ntree) to be 500 and we tune the number of variables randomly sampled at each split (mtry) on the values 8, 10, 12. Best tune mtry is selected as `r model_RF[["bestTune"]][["mtry"]]`. We set classProbs = TRUE and summaryFunction = twoClassSummary in order to use "ROC" as the metric to decide on the best model. 
+
+Random Forest Classifier with Smote data gives `r round(balanced_accuracy_train*100, 2)`% balanced accuracy for train and `r round(balanced_accuracy_test*100, 2)`% balanced accuracy for test.
+
+```{r final-random-forest}
+############    0.8726 without setting the seed
+
+set.seed(50)
+n_folds=10
+fitControl<-trainControl(method = "repeatedcv", number = n_folds, repeats = 1, classProbs = TRUE, search="random", savePred=TRUE, summaryFunction = twoClassSummary)   
+rf_grid<-expand.grid(mtry = c(8, 10, 12))
+model_RF <- train(y ~ ., data = trainn, method = "rf", trControl = fitControl, ntree=500, nodesize = 5, tuneGrid = rf_grid, metric = "ROC")
+
+cm_rf_train <- confusionMatrix(factor(predict(model_RF, newdata=trainn[,-47])), factor(trainn$y))
+balanced_accuracy_train <- cm_rf_train[["byClass"]][["Balanced Accuracy"]]
+
+pred_RF1 <- predict(model_RF, newdata=X_test_submission, type = 'prob')
+pred_RF <- pred_RF1[,2] #submission
+```
+
+Using oversampling, we fit the model on `train` which is factorized and balanced. Then we predict using `train` and `test` in order to compare their balanced accuracy results. If we think the model is good enough then we will fit the model on `final_train` and make predictions on `X_test_submission`. 
+
+Area under the ROC curve (AUC) covers `r round(0.9075592*100,2)`%, Balanced Accuracy Score is `r round(0.8378372*100,2)`% and their mean is `r round(0.8726982*100,2)`% which is our final score. 
+
+
+# Results
+The following results can be obtained:
+
+* Random Forest with 10-Fold Cross Validation gives `r model_RF[["bestTune"]][["mtry"]]` value as best tuned mtry on training. 
+* Balanced accuracy value for train set is `r round(balanced_accuracy_train*100,2)`%.
+* Balanced accuracy values for test set is `r round(balanced_accuracy_test*100,2)`%. 
+* If the accuracy values are close, this means that the model is NOT overfitting and it is generalizing the underlying interaction of features. Here they are not very close but still enough to proceed. 
+
+Discussion: 
+
+We have tried many models and we have seen that due to categorical features there could be nonlinear relationships. Therefore, we preferred not to use linear models such as Penalized Regression Approach (PRA) and Logistic Regression. This leads us using Tree Based Models. We do not prefer Decision Tree since it behaves greedy on the continuous features. On the other hand, Random Forest models selects samples randomly as well as features. Selecting features randomly makes trees uncorrelated and helps the model avoid greedyness. In such models, there are two parameters to be tuned; number of trees and number of features. In our model, we set the number of trees as 500 and we only tune the number of features at each tree (mtry). 
+
+# Conclusions and Future Work
+
+* Over-sampling with SMOTE is an effective method to resolve class imbalance problem.
+* Eliminating least important features improves the model performance.
+* Different models can be created by eliminating different feature sets.
+* Some of our models had train-test balanced accuracies very close but they did not give good result on the submission data. This shows that such models did not capture the noisiness. 
+
+Possible extensions to have a better approach:
+* More observations provide better prediction models. 
+* Knowing more insight about the features may be helpful on investigating the interactions and making more meaningful manipulations.
+
+
+# Code
+The Github link for the codes is (HERE)[https://github.com/BU-IE-582/fall20-ilaydacelenk/blob/master/files/IE582-Project-Error_Loading.Rmd].
+
+# Submission Codes
+
+```{r submission_functions}
+require(jsonlite)
+require(httr)
+require(data.table)
+
+get_token <- function(username, password, url_site){
+    
+    post_body = list(username=username,password=password)
+    post_url_string = paste0(url_site,'/token/')
+    result = POST(post_url_string, body = post_body)
+
+    # error handling (wrong credentials)
+    if(result$status_code==400){
+        print('Check your credentials')
+        return(0)
+    }
+    else if (result$status_code==201){
+        output = content(result)
+        token = output$key
+    }
+
+    return(token)
+}
+
+send_submission <- function(predictions, token, url_site, submit_now=F){
+    
+    format_check=check_format(predictions)
+    if(!format_check){
+        return(FALSE)
+    }
+    
+    post_string="list("
+    for(i in 1:length(predictions)){
+        if(i<length(predictions)){
+            post_string=sprintf("%s%s,",post_string,predictions[i])
+        } else {
+            post_string=sprintf("%s%s)",post_string,predictions[i])
+        }
+    }
+    
+    submission = eval(parse(text=post_string))
+    json_body = jsonlite::toJSON(submission, auto_unbox = TRUE)
+    submission=list(submission=json_body)
+    print(submission)
+
+    if(!submit_now){
+        print("You did not submit.")
+        return(FALSE)      
+    }
+    
+
+    header = add_headers(c(Authorization=paste('Token',token,sep=' ')))
+    post_url_string = paste0(url_site,'/submission/')
+    result = POST(post_url_string, header, body=submission)
+    
+    if (result$status_code==201){
+        print("Successfully submitted. Below you can see the details of your submission")
+    } else {
+        print("Could not submit. Please check the error message below, contact the assistant if needed.")
+    }
+    
+    print(content(result))
+    
+}
+
+check_format <- function(predictions){
+    
+    if(all(is.numeric(predictions)) & all(predictions<=1)){
+        print("Format OK")
+        return(TRUE)
+    } else {
+        print("Wrong format")
+        return(FALSE)
+    }
+    
+}
+```
+
+
+```{r submission}
+# this part is main code
+subm_url = 'http://46.101.121.83'
+
+u_name = "Error_Loading"
+p_word = "UHAxWUfYKVZNQmgq"
+submit_now = FALSE
+
+username = u_name
+password = p_word
+
+token = get_token(username=u_name, password=p_word, url=subm_url)
+
+predictions <- pred_RF
+
+send_submission(predictions, token, url=subm_url, submit_now= submit_now)
+```
+
+
+[1] "Format OK"
+$submission
+[0.046,0.17,0.504,0.058,0.762,0.23,0.59,0.546,0.122,0.004,0.426,0.538,0.016,0.878,0.13,0.056,0.014,0.302,0.376,0.008,0.066,0.532,0.892,0.016,0.636,0.052,0.49,0.504,0.51,0.336,0.446,0.866,0.02,0.588,0.748,0.25,0.808,0.668,0.876,0.034,0.184,0.17,0.102,0.844,0.338,0.852,0.24,0.024,0.352,0.098,0.02,0.028,0.174,0.388,0.828,0.398,0.736,0.59,0.128,0.64,0.888,0.012,0.12,0.202,0.064,0.054,0.012,0.016,0.692,0.156,0.662,0.012,0.03,0.616,0.058,0.182,0.908,0.048,0.608,0.088,0.906,0.114,0.01,0.578,0.408,0.364,0.02,0.06,0.834,0.272,0.02,0.014,0.068,0.82,0.1,0.538,0.172,0.07,0.568,0.504,0.558,0.028,0.754,0.48,0.464,0.51,0.032,0.242,0.216,0.028,0.022,0.83,0.09,0.89,0.394,0.026,0.006,0.466,0.052,0.016,0.026,0.088,0.026,0.154,0.238,0.034,0.034,0.372,0.712,0.034,0.68,0.406,0.372,0.466,0.484,0.708,0.062,0.728,0.126,0.714,0.558,0.2,0.484,0.578,0.66,0.49,0.756,0.418,0.41,0.092,0.058,0.478,0.258,0.118,0.014,0.112,0.032,0.604,0.408,0.948,0.16,0.146,0.036,0.032,0.018,0.552,0.066,0.662,0.022,0.16,0.766,0.512,0.644,0.038,0.44,0.012,0.406,0.542,0.836,0.904,0.872,0.77,0.64,0.012,0.888,0.028,0.008,0.18,0.196,0.218,0.012,0.484,0.708,0.222,0.026,0.01,0.036,0.018,0.016,0.8,0.842,0.154,0.278,0.614,0.532,0.56,0.038,0.856,0.066,0.824,0.028,0.01,0.07,0.57,0.236,0.724,0.086,0.044,0.014,0.04,0.038,0.01,0.518,0.7,0.04,0.088,0.162,0.704,0.238,0.02,0.822,0.044,0.436,0.074,0.016,0.04,0.43,0.228,0.582,0.71,0.11,0.044,0.058,0.096,0.068,0.046,0.454,0.764,0.444,0.01,0.03,0.732,0.858,0.434,0.04,0.524,0.898,0.48,0.12,0.232,0.548,0.282,0.046,0.304,0.73,0.392,0.064,0.116,0.102,0.116,0.534,0.068,0.436,0.422,0.036,0.172,0.672,0.03,0.382,0.398,0.458,0.086,0.386,0.088,0.818,0.41,0.11,0.74,0.798,0.516,0.53,0.07,0.412,0.608,0.43,0.814,0.72,0.116,0.084,0.08,0.842,0.042,0.02,0.008,0.042,0.062,0.114,0.304,0.082,0.014,0.124,0.662,0.626,0.048,0.03,0.63,0.24,0.106,0.644,0.536,0.034,0.106,0.034,0.584,0.172,0.846,0.66,0.528,0.046,0.398,0.606,0.204,0.56,0.714,0.888,0.16,0.752,0.61,0.04,0.106,0.076,0.15,0.074,0.628,0.67,0.026,0.244,0.43,0.04,0.056,0.05,0.018,0.19,0.74,0.142,0.434,0.774,0.112,0.064,0.218,0.082,0.034,0.228,0.1,0.464,0.204,0.618,0.026,0.028,0.078,0.714,0.1,0.014,0.084,0.102,0.818,0.114,0.098,0.016,0.564,0.428,0.68,0.03,0.764,0.218,0.048,0.016,0.35,0.074,0.466,0.012,0.102,0.744,0.252,0.08,0.584,0.096,0.07,0.016,0.036,0.066,0.736,0.106,0.87,0.074,0.536,0.102,0.522,0.774,0.078,0.348,0.028,0.452,0.032,0.57,0.436,0.384,0.678,0.41,0.792,0.498,0.798,0.004,0.042,0.31,0.498,0.378,0.604,0.188,0.42,0.44,0.094,0.452,0.402,0.52,0.206,0.012,0.168,0.546,0.498,0.116,0.098,0.13,0.786,0.348,0.512,0.01,0.01,0.606,0.05,0.652,0.284,0.054,0.796,0.286,0.012,0.386,0.45,0.826,0.786,0.088,0.06,0.262,0.814,0.052,0.496,0.476,0.034,0.05,0.696,0.338,0.786,0.098,0.064,0.608,0.046,0.296,0.712,0.342,0.02,0.01,0.076,0.838,0.12,0.016,0.152,0.546,0.046,0.438,0.05,0.752,0.674,0.808,0.646,0.108,0.024,0.876,0.016,0.81,0.086,0.164,0.102,0.006,0.018,0.146,0.01,0.57,0.578,0.092,0.016,0.652,0.592,0.01,0.028,0.028,0.552,0.096,0.054,0.658,0.436,0.014,0.036,0.63,0.016,0.248,0.486,0.054,0.632,0.154,0.014,0.428,0.012,0.564,0.774,0.434,0.014,0.942,0.872,0.37,0.178,0.138,0.876,0.018,0.254,0.104,0.064,0.644,0.824,0.01,0.624,0.01,0.032,0.112,0.832,0.56,0.502,0.124,0.034,0.07,0.576,0.036,0.068,0.032,0.166,0.258,0.02,0.296,0.074,0.616,0.528,0.03,0.192,0.51,0.35,0.452,0.568,0.71,0.428,0.08,0.044,0.038,0.022,0.558,0.696,0.262,0.43,0.036,0.21,0.358,0.046,0.486,0.27,0.08,0.014,0.028,0.712,0.034,0.04,0.036,0.668,0.066,0.276,0.608,0.058,0.05,0.432,0.9,0.102,0.074,0.074,0.24,0.48,0.666,0.112,0.124,0.564,0.05,0.31,0.128,0.978,0.296,0.686,0.908,0.604,0.592,0.294,0.054,0.022,0.446,0.06,0.254,0.15,0.668,0.512,0.53,0.014,0.344,0.286,0.016,0.236,0.222,0.146,0.012,0.132,0.156,0.026,0.196,0.064,0.654,0.46,0.158,0.052,0.54,0.558,0.312,0.484,0.79,0.622,0.714,0.306,0.346,0.008,0.088,0.722,0.534,0.186,0.726,0.038,0.002,0.71,0.536,0.044,0.006,0.848,0.452,0.712,0.016,0.614,0.498,0.446,0.04,0.912,0.112,0.466,0.116,0.728,0.408,0.534,0.114,0.26,0.046,0.106,0.698,0.528,0.034,0.564,0.086,0.022,0.026,0.256,0.056,0.288,0.66,0.242,0.704,0.654,0.3,0.04,0.574,0.084,0.49,0.898,0.026,0.04,0.566,0.77,0.516,0.482,0.828,0.072,0.316,0.468,0.72,0.054,0.064,0.026,0.446,0.516,0.502,0.032,0.558,0.584,0.282,0.056,0.038,0.062,0.052,0.584,0.056,0.032,0.014,0.088,0.822,0.076,0.872,0.148,0.604,0.816,0.006,0.332,0.01,0.05,0.298,0.31,0.078,0.706,0.322,0.038,0.056,0.018,0.412,0.584,0.054,0.454,0.814,0.084,0.02,0.042,0.632,0.282,0.032,0.04,0.606,0.91,0.664,0.152,0.776,0.636,0.024,0.528,0.214,0.016,0.786,0.008,0.062,0.528,0.528,0.54,0.104,0.514,0.012,0.298,0.688,0.038,0.416,0.016,0.008,0.052,0.062,0.71,0.194,0.042,0.534,0.122,0.268,0.048,0.64,0.048,0.094,0.846,0.592,0.098,0.006,0.058,0.386,0.632,0.184,0.406,0.542,0.042,0.188,0.032,0.586,0.598,0.044,0.034,0.746,0.01,0.378,0.62,0.046,0.018,0.724,0.704,0.658,0.564,0.144,0.436,0.048,0.808,0.28,0.804,0.03,0.93,0.7,0.818,0.048,0.142,0.078,0.398,0.086,0.448,0.726,0.036,0.818,0.462,0.032,0.024,0.016,0.73,0.032,0.038,0.078,0.67,0.482,0.028,0.156,0.59,0.352,0.132,0.038,0.02,0.012,0.362,0.408,0.568,0.13,0.506,0.668,0.854,0.926,0.654,0.612,0.2,0.134,0.166,0.054,0.796,0.506,0.664,0.804,0.738,0.272,0.4,0.246,0.11,0.17,0.342,0.182,0.334,0.242,0.614,0.016,0.56,0.664,0.176,0.152,0.032,0.534,0.54,0.046,0.896,0.816,0.608,0.088,0.02,0.53,0.616,0.546,0.054,0.01,0.708,0.498,0.822,0.04,0.006,0.44,0.568,0.258,0.598,0.974,0.062,0.068,0.752,0.19,0.058,0.59,0.096,0.064,0.468,0.582,0.606,0.598,0.016,0.41,0.05,0.038,0.936,0.842,0.884,0.446,0.39,0.076,0.914,0.146,0.448,0.042,0.018,0.672,0.06,0.038,0.242,0.016,0.054,0.04,0.48,0.18,0.06,0.49,0.656,0.102,0.458,0.714,0.428,0.584,0.04,0.928,0.386,0.51,0.818,0.942,0.618,0.448,0.594,0.506,0.416,0.43,0.322,0.448,0.014,0.064,0.07,0.068,0.286,0.076,0.86,0.464,0.038,0.006,0.61,0.08,0.404,0.5,0.474,0.348,0.788,0.792,0.022,0.018,0.05,0.49,0.18,0.08,0.56,0.1,0.812,0.436,0.39,0.324,0.808,0.232,0.006,0.01,0.006,0.016,0.174,0.268,0.374,0.36,0.018,0.102,0.568,0.73,0.614,0.618,0.046,0.162,0.618,0.046,0.116,0.858,0.688,0.852,0.026,0.04,0.072,0.554,0.116,0.828,0.406,0.37,0.026,0.574,0.026,0.08,0.5,0.01,0.018,0.45,0.034,0.004,0.038,0.346,0.318,0.542,0.474,0.56,0.008,0.676,0.822,0.456,0.74,0.584,0.288,0.148,0.06,0.394,0.038,0.448,0.758,0.724,0.076,0.066,0.612,0.64,0.01,0.534,0.62,0.932,0.174,0.712,0.702,0.798,0.084,0.278,0.176,0.468,0.62,0.028,0.956,0.22,0.028,0.198,0.586,0.154,0.432,0.562,0.31,0.06,0.634,0.018,0.112,0.298,0.318,0.75,0.584,0.716,0.084,0.592,0.034,0.51,0.274,0.064,0.81,0.708,0.614,0.016,0.054,0.018,0.11,0.902,0.572,0.134,0.132,0.026,0.25,0.254,0.096,0.386,0.118,0.626,0.02,0.62,0.08,0.016,0.756,0.924,0.258,0.112,0.046,0.046,0.538,0.03,0.396,0.082,0.03,0.12,0.496,0.084,0.71,0.754,0.27,0.762,0.608,0.586,0.71,0.06,0.652,0.23,0.26,0.142,0.55,0.706,0.114,0.356,0.008,0.604,0.356,0.076,0.424,0.08,0.532,0.038,0.56,0.024,0.422,0.306,0.042,0.01,0.088,0.444,0.732,0.488,0.024,0.028,0.09,0.48,0.076,0.136,0.416,0.47,0.244,0.252,0.05,0.16,0.03,0.438,0.04,0.068,0.134,0.042,0.656,0.06,0.022,0.934,0.516,0.912,0.186,0.254,0.172,0.472,0.02,0.012,0.522,0.028,0.082,0.488,0.544,0.346,0.024,0.064,0.8,0.594,0.054,0.084,0.262,0.436,0.858,0.858,0.54,0.232,0.014,0.02,0.738,0.406,0.052,0.572,0.026,0.174,0.446,0.46,0.916,0.312,0.346,0.22,0.874,0.028,0.046,0.554,0.04,0.32,0.596,0.046,0.05,0.734,0.04,0.144,0.498,0.042,0.524,0.036,0.052,0.616,0.058,0.496,0.64,0.456,0.468,0.026,0.048,0.034,0.614,0.016,0.022,0.072,0.02,0.524,0.072,0.79,0.166,0.424,0.872,0.524,0.812,0.042,0.754,0.794,0.256,0.03,0.496,0.696,0.018,0.676,0.67,0.434,0.718,0.048,0.068,0.806,0.006,0.176,0.104,0.236,0.008,0.444,0.638,0.008,0.128,0.52,0.762,0.75,0.444,0.432,0.512,0.02,0.706,0.182,0.018,0.304,0.094,0.056,0.384,0.634,0.42,0.188,0.666,0.456,0.022,0.012,0.316,0.082,0.408,0.012,0.376,0.604,0.478,0.018,0.48,0.03,0.164,0.266,0.072,0.018,0.358,0.072,0.81,0.722,0.476,0.498,0.448,0.01,0.62,0.536,0.546,0.612,0.574,0.01,0.454,0.26,0.12,0.354,0.37,0.656,0.246,0.064,0.046,0.35,0.01,0.832,0.2,0.51,0.464,0.516,0.674,0.162,0.508,0.51,0.404,0.602,0.53,0.122,0.028,0.032,0.07,0.146,0.498,0.06,0.358,0.046,0.084,0.044,0.182,0.744,0.016,0.648,0.834,0.084,0.474,0.254,0.152,0.16,0.754,0.006,0.818,0.166,0.078,0.68,0.738,0.06,0.012,0.434,0.408,0.69,0.444,0.484,0.65,0.434,0.33,0.026,0.838,0.02,0.714,0.036,0.724,0.034,0.482,0.188,0.016,0.504,0.5,0.062,0.026,0.804,0.114,0.244,0.63,0.036,0.214,0.49,0.088,0.04,0.304,0.456,0.146,0.764,0.494,0.398,0.022,0.502,0.49,0.004,0.602,0.57,0.692,0.142,0.814,0.064,0.042,0.006,0.724,0.438,0.01,0.02,0.01,0.058,0.112,0.53,0.51,0.072,0.73,0.06,0.352,0.924,0.01,0.234,0.562,0.156,0.304,0.4,0.652,0.942,0.766,0.5,0.414,0.28,0.104,0.014,0.034,0.084,0.788,0.38,0.134,0.098,0.524,0.076,0.036,0.782,0.838,0.692,0.648,0.328,0.01,0.058,0.062,0.916,0.012,0.2,0.372,0.694,0.028,0.006,0.366,0.694,0.794,0.474,0.04,0.406,0.474,0.94,0.05,0.25,0.694,0.444,0.238,0.792,0.028,0.194,0.826,0.272,0.012,0.56,0.112,0.022,0.698,0.112,0.362,0.016,0.366,0.006,0.054,0.102,0.112,0.038,0.038,0.1,0.052,0.05,0.006,0.038,0.036,0.028,0.002,0.518,0.766,0.406,0.044,0.01,0.708,0.254,0.132,0.6,0.89,0.084,0.648,0.052,0.054,0.828,0.37,0.588,0.566,0.38,0.244,0.028,0.646,0.08,0.086,0.48,0.642,0.644,0.198,0.632,0.418,0.234,0.174,0.118,0.628,0.1,0.022,0.768,0.366,0.444,0.014,0.046,0.544,0.476,0.776,0.052,0.598,0.112,0.676,0.02,0.034,0.47,0.754,0.95,0.008,0.04,0.016,0.15,0.516,0.012,0.908,0.762,0.772,0.484,0.748,0.114,0.734,0.464,0.096,0.244,0.578,0.374,0.164,0.466,0.4,0.006,0.078,0.006,0.654,0.566,0.144,0.458,0.058,0.208,0.486,0.032,0.556,0.094,0.006,0.584,0.142,0.034,0.066,0.376,0.242,0.018,0.474,0.538,0.026,0.464,0.088,0.06,0.288,0.382,0.308,0.018,0.318,0.092,0.384,0.252,0.016,0.03,0.45,0.536,0.944,0.038,0.218,0.028,0.428,0.438,0.218,0.086,0.52,0.214,0.058,0.018,0.528,0.174,0.024,0.056,0.434,0.6,0.19,0.024,0.012,0.478,0.13,0.414,0.204,0.654,0.158,0.484,0.072,0.46,0.208,0.12,0.744,0.746,0.082,0.566,0.2,0.02,0.034,0.228,0.286,0.524,0.392,0.45,0.016,0.368,0.804,0.786,0.14,0.064,0.032,0.466,0.014,0.034,0.702,0.108,0.202,0.438,0.936,0.076,0.07,0.472,0.034,0.64,0.62,0.784,0.418,0.178,0.026,0.042,0.004,0.644,0.534,0.056,0.6,0.042,0.75,0.536,0.744,0.016,0.832,0.57,0.232,0.026,0.366,0.072,0.112,0.602,0.208,0.008,0.222,0.406,0.044,0.028,0.562,0.428,0.322,0.014,0.506,0.324,0.496,0.366,0.06,0.614,0.48,0.768,0.036,0.222,0.098,0.022,0.044,0.098,0.126,0.796,0.068,0.118,0.068,0.668,0.05,0.632,0.058,0.03,0.198,0.794,0.56,0.664,0.696,0.014,0.55,0.646,0.128,0.13,0.788,0.01,0.224,0.632,0.026,0.312,0.126,0.392,0.85,0.04,0.658,0.06,0.818,0.386,0.48,0.766,0.034,0.026,0.048,0.834,0.742,0.034,0.01,0.03,0.084,0.034,0.074,0.056,0.764,0.15,0.012,0.77,0.704,0.224,0.052,0.864,0.026,0.47,0.042,0.382,0.012,0.346,0.528,0.142,0.514,0.01,0.732,0.2,0.004,0.598,0.072,0.828,0.518,0.306,0.166,0.716,0.134,0.096,0.398,0.022,0.454,0.844,0.216,0.038,0.404,0.038,0.22,0.01,0.644,0.552,0.75,0.044,0.01,0.06,0.908,0.028,0.536,0.128,0.024,0.186,0.026,0.602,0.054,0.734,0.6,0.674,0.038,0.024,0.418,0.03,0.616,0.016,0.872,0.728,0.698,0.092,0.202,0.378,0.356,0.6,0.022,0.01,0.904,0.156,0.764,0.706,0.02,0.662,0.104,0.348,0.452,0.462,0.108,0.616,0.406,0.036,0.068,0.636,0.536,0.456,0.172,0.36,0.462,0.346,0.718,0.466,0.32,0.412,0.176,0.028,0.83,0.016,0.026,0.616,0.618,0.018,0.022,0.198,0.064,0.82,0.088,0.564,0.018,0.188,0.114,0.946,0.698,0.702,0.038,0.67,0.052,0.174,0.316,0.414,0.69,0.59,0.022,0.156,0.102,0.188,0.074,0.718,0.94,0.59,0.53,0.442,0.102,0.5,0.04,0.372,0.364,0.276,0.136,0.044,0.972,0.476,0.064,0.066,0.788,0.492,0.184,0.164,0.448,0.042,0.714,0.87,0.676,0.464,0.03,0.762,0.102,0.07,0.712,0.284,0.508,0.014,0.064,0.624,0.16,0.166,0.392,0.166,0.036,0.51,0.224,0.42,0.548,0.218,0.356,0.014,0.764,0.52,0.446,0.116,0.55,0.262,0.63,0.226,0.448,0.258,0.83,0.544,0.348,0.016,0.094,0.884,0.1,0.008,0.01,0.464,0.01,0.534,0.32,0.018,0.036,0.016,0.08,0.052,0.068,0.352,0.076,0.47,0.058,0.054,0.388,0.052,0.176,0.746,0.402,0.714,0.322,0.024,0.056,0.126,0.072,0.012,0.448,0.014,0.676,0.012,0.256,0.542,0.01,0.62,0.026,0.19] 
+
+[1] "Successfully submitted. Below you can see the details of your submission"
+$url
+[1] "http://46.101.121.83/submission/665/"
+
+$submission
+[1] "[0.046, 0.17, 0.504, 0.058, 0.762, 0.23, 0.59, 0.546, 0.122, 0.004, 0.426, 0.538, 0.016, 0.878, 0.13, 0.056, 0.014, 0.302, 0.376, 0.008, 0.066, 0.532, 0.892, 0.016, 0.636, 0.052, 0.49, 0.504, 0.51, 0.336, 0.446, 0.866, 0.02, 0.588, 0.748, 0.25, 0.808, 0.668, 0.876, 0.034, 0.184, 0.17, 0.102, 0.844, 0.338, 0.852, 0.24, 0.024, 0.352, 0.098, 0.02, 0.028, 0.174, 0.388, 0.828, 0.398, 0.736, 0.59, 0.128, 0.64, 0.888, 0.012, 0.12, 0.202, 0.064, 0.054, 0.012, 0.016, 0.692, 0.156, 0.662, 0.012, 0.03, 0.616, 0.058, 0.182, 0.908, 0.048, 0.608, 0.088, 0.906, 0.114, 0.01, 0.578, 0.408, 0.364, 0.02, 0.06, 0.834, 0.272, 0.02, 0.014, 0.068, 0.82, 0.1, 0.538, 0.172, 0.07, 0.568, 0.504, 0.558, 0.028, 0.754, 0.48, 0.464, 0.51, 0.032, 0.242, 0.216, 0.028, 0.022, 0.83, 0.09, 0.89, 0.394, 0.026, 0.006, 0.466, 0.052, 0.016, 0.026, 0.088, 0.026, 0.154, 0.238, 0.034, 0.034, 0.372, 0.712, 0.034, 0.68, 0.406, 0.372, 0.466, 0.484, 0.708, 0.062, 0.728, 0.126, 0.714, 0.558, 0.2, 0.484, 0.578, 0.66, 0.49, 0.756, 0.418, 0.41, 0.092, 0.058, 0.478, 0.258, 0.118, 0.014, 0.112, 0.032, 0.604, 0.408, 0.948, 0.16, 0.146, 0.036, 0.032, 0.018, 0.552, 0.066, 0.662, 0.022, 0.16, 0.766, 0.512, 0.644, 0.038, 0.44, 0.012, 0.406, 0.542, 0.836, 0.904, 0.872, 0.77, 0.64, 0.012, 0.888, 0.028, 0.008, 0.18, 0.196, 0.218, 0.012, 0.484, 0.708, 0.222, 0.026, 0.01, 0.036, 0.018, 0.016, 0.8, 0.842, 0.154, 0.278, 0.614, 0.532, 0.56, 0.038, 0.856, 0.066, 0.824, 0.028, 0.01, 0.07, 0.57, 0.236, 0.724, 0.086, 0.044, 0.014, 0.04, 0.038, 0.01, 0.518, 0.7, 0.04, 0.088, 0.162, 0.704, 0.238, 0.02, 0.822, 0.044, 0.436, 0.074, 0.016, 0.04, 0.43, 0.228, 0.582, 0.71, 0.11, 0.044, 0.058, 0.096, 0.068, 0.046, 0.454, 0.764, 0.444, 0.01, 0.03, 0.732, 0.858, 0.434, 0.04, 0.524, 0.898, 0.48, 0.12, 0.232, 0.548, 0.282, 0.046, 0.304, 0.73, 0.392, 0.064, 0.116, 0.102, 0.116, 0.534, 0.068, 0.436, 0.422, 0.036, 0.172, 0.672, 0.03, 0.382, 0.398, 0.458, 0.086, 0.386, 0.088, 0.818, 0.41, 0.11, 0.74, 0.798, 0.516, 0.53, 0.07, 0.412, 0.608, 0.43, 0.814, 0.72, 0.116, 0.084, 0.08, 0.842, 0.042, 0.02, 0.008, 0.042, 0.062, 0.114, 0.304, 0.082, 0.014, 0.124, 0.662, 0.626, 0.048, 0.03, 0.63, 0.24, 0.106, 0.644, 0.536, 0.034, 0.106, 0.034, 0.584, 0.172, 0.846, 0.66, 0.528, 0.046, 0.398, 0.606, 0.204, 0.56, 0.714, 0.888, 0.16, 0.752, 0.61, 0.04, 0.106, 0.076, 0.15, 0.074, 0.628, 0.67, 0.026, 0.244, 0.43, 0.04, 0.056, 0.05, 0.018, 0.19, 0.74, 0.142, 0.434, 0.774, 0.112, 0.064, 0.218, 0.082, 0.034, 0.228, 0.1, 0.464, 0.204, 0.618, 0.026, 0.028, 0.078, 0.714, 0.1, 0.014, 0.084, 0.102, 0.818, 0.114, 0.098, 0.016, 0.564, 0.428, 0.68, 0.03, 0.764, 0.218, 0.048, 0.016, 0.35, 0.074, 0.466, 0.012, 0.102, 0.744, 0.252, 0.08, 0.584, 0.096, 0.07, 0.016, 0.036, 0.066, 0.736, 0.106, 0.87, 0.074, 0.536, 0.102, 0.522, 0.774, 0.078, 0.348, 0.028, 0.452, 0.032, 0.57, 0.436, 0.384, 0.678, 0.41, 0.792, 0.498, 0.798, 0.004, 0.042, 0.31, 0.498, 0.378, 0.604, 0.188, 0.42, 0.44, 0.094, 0.452, 0.402, 0.52, 0.206, 0.012, 0.168, 0.546, 0.498, 0.116, 0.098, 0.13, 0.786, 0.348, 0.512, 0.01, 0.01, 0.606, 0.05, 0.652, 0.284, 0.054, 0.796, 0.286, 0.012, 0.386, 0.45, 0.826, 0.786, 0.088, 0.06, 0.262, 0.814, 0.052, 0.496, 0.476, 0.034, 0.05, 0.696, 0.338, 0.786, 0.098, 0.064, 0.608, 0.046, 0.296, 0.712, 0.342, 0.02, 0.01, 0.076, 0.838, 0.12, 0.016, 0.152, 0.546, 0.046, 0.438, 0.05, 0.752, 0.674, 0.808, 0.646, 0.108, 0.024, 0.876, 0.016, 0.81, 0.086, 0.164, 0.102, 0.006, 0.018, 0.146, 0.01, 0.57, 0.578, 0.092, 0.016, 0.652, 0.592, 0.01, 0.028, 0.028, 0.552, 0.096, 0.054, 0.658, 0.436, 0.014, 0.036, 0.63, 0.016, 0.248, 0.486, 0.054, 0.632, 0.154, 0.014, 0.428, 0.012, 0.564, 0.774, 0.434, 0.014, 0.942, 0.872, 0.37, 0.178, 0.138, 0.876, 0.018, 0.254, 0.104, 0.064, 0.644, 0.824, 0.01, 0.624, 0.01, 0.032, 0.112, 0.832, 0.56, 0.502, 0.124, 0.034, 0.07, 0.576, 0.036, 0.068, 0.032, 0.166, 0.258, 0.02, 0.296, 0.074, 0.616, 0.528, 0.03, 0.192, 0.51, 0.35, 0.452, 0.568, 0.71, 0.428, 0.08, 0.044, 0.038, 0.022, 0.558, 0.696, 0.262, 0.43, 0.036, 0.21, 0.358, 0.046, 0.486, 0.27, 0.08, 0.014, 0.028, 0.712, 0.034, 0.04, 0.036, 0.668, 0.066, 0.276, 0.608, 0.058, 0.05, 0.432, 0.9, 0.102, 0.074, 0.074, 0.24, 0.48, 0.666, 0.112, 0.124, 0.564, 0.05, 0.31, 0.128, 0.978, 0.296, 0.686, 0.908, 0.604, 0.592, 0.294, 0.054, 0.022, 0.446, 0.06, 0.254, 0.15, 0.668, 0.512, 0.53, 0.014, 0.344, 0.286, 0.016, 0.236, 0.222, 0.146, 0.012, 0.132, 0.156, 0.026, 0.196, 0.064, 0.654, 0.46, 0.158, 0.052, 0.54, 0.558, 0.312, 0.484, 0.79, 0.622, 0.714, 0.306, 0.346, 0.008, 0.088, 0.722, 0.534, 0.186, 0.726, 0.038, 0.002, 0.71, 0.536, 0.044, 0.006, 0.848, 0.452, 0.712, 0.016, 0.614, 0.498, 0.446, 0.04, 0.912, 0.112, 0.466, 0.116, 0.728, 0.408, 0.534, 0.114, 0.26, 0.046, 0.106, 0.698, 0.528, 0.034, 0.564, 0.086, 0.022, 0.026, 0.256, 0.056, 0.288, 0.66, 0.242, 0.704, 0.654, 0.3, 0.04, 0.574, 0.084, 0.49, 0.898, 0.026, 0.04, 0.566, 0.77, 0.516, 0.482, 0.828, 0.072, 0.316, 0.468, 0.72, 0.054, 0.064, 0.026, 0.446, 0.516, 0.502, 0.032, 0.558, 0.584, 0.282, 0.056, 0.038, 0.062, 0.052, 0.584, 0.056, 0.032, 0.014, 0.088, 0.822, 0.076, 0.872, 0.148, 0.604, 0.816, 0.006, 0.332, 0.01, 0.05, 0.298, 0.31, 0.078, 0.706, 0.322, 0.038, 0.056, 0.018, 0.412, 0.584, 0.054, 0.454, 0.814, 0.084, 0.02, 0.042, 0.632, 0.282, 0.032, 0.04, 0.606, 0.91, 0.664, 0.152, 0.776, 0.636, 0.024, 0.528, 0.214, 0.016, 0.786, 0.008, 0.062, 0.528, 0.528, 0.54, 0.104, 0.514, 0.012, 0.298, 0.688, 0.038, 0.416, 0.016, 0.008, 0.052, 0.062, 0.71, 0.194, 0.042, 0.534, 0.122, 0.268, 0.048, 0.64, 0.048, 0.094, 0.846, 0.592, 0.098, 0.006, 0.058, 0.386, 0.632, 0.184, 0.406, 0.542, 0.042, 0.188, 0.032, 0.586, 0.598, 0.044, 0.034, 0.746, 0.01, 0.378, 0.62, 0.046, 0.018, 0.724, 0.704, 0.658, 0.564, 0.144, 0.436, 0.048, 0.808, 0.28, 0.804, 0.03, 0.93, 0.7, 0.818, 0.048, 0.142, 0.078, 0.398, 0.086, 0.448, 0.726, 0.036, 0.818, 0.462, 0.032, 0.024, 0.016, 0.73, 0.032, 0.038, 0.078, 0.67, 0.482, 0.028, 0.156, 0.59, 0.352, 0.132, 0.038, 0.02, 0.012, 0.362, 0.408, 0.568, 0.13, 0.506, 0.668, 0.854, 0.926, 0.654, 0.612, 0.2, 0.134, 0.166, 0.054, 0.796, 0.506, 0.664, 0.804, 0.738, 0.272, 0.4, 0.246, 0.11, 0.17, 0.342, 0.182, 0.334, 0.242, 0.614, 0.016, 0.56, 0.664, 0.176, 0.152, 0.032, 0.534, 0.54, 0.046, 0.896, 0.816, 0.608, 0.088, 0.02, 0.53, 0.616, 0.546, 0.054, 0.01, 0.708, 0.498, 0.822, 0.04, 0.006, 0.44, 0.568, 0.258, 0.598, 0.974, 0.062, 0.068, 0.752, 0.19, 0.058, 0.59, 0.096, 0.064, 0.468, 0.582, 0.606, 0.598, 0.016, 0.41, 0.05, 0.038, 0.936, 0.842, 0.884, 0.446, 0.39, 0.076, 0.914, 0.146, 0.448, 0.042, 0.018, 0.672, 0.06, 0.038, 0.242, 0.016, 0.054, 0.04, 0.48, 0.18, 0.06, 0.49, 0.656, 0.102, 0.458, 0.714, 0.428, 0.584, 0.04, 0.928, 0.386, 0.51, 0.818, 0.942, 0.618, 0.448, 0.594, 0.506, 0.416, 0.43, 0.322, 0.448, 0.014, 0.064, 0.07, 0.068, 0.286, 0.076, 0.86, 0.464, 0.038, 0.006, 0.61, 0.08, 0.404, 0.5, 0.474, 0.348, 0.788, 0.792, 0.022, 0.018, 0.05, 0.49, 0.18, 0.08, 0.56, 0.1, 0.812, 0.436, 0.39, 0.324, 0.808, 0.232, 0.006, 0.01, 0.006, 0.016, 0.174, 0.268, 0.374, 0.36, 0.018, 0.102, 0.568, 0.73, 0.614, 0.618, 0.046, 0.162, 0.618, 0.046, 0.116, 0.858, 0.688, 0.852, 0.026, 0.04, 0.072, 0.554, 0.116, 0.828, 0.406, 0.37, 0.026, 0.574, 0.026, 0.08, 0.5, 0.01, 0.018, 0.45, 0.034, 0.004, 0.038, 0.346, 0.318, 0.542, 0.474, 0.56, 0.008, 0.676, 0.822, 0.456, 0.74, 0.584, 0.288, 0.148, 0.06, 0.394, 0.038, 0.448, 0.758, 0.724, 0.076, 0.066, 0.612, 0.64, 0.01, 0.534, 0.62, 0.932, 0.174, 0.712, 0.702, 0.798, 0.084, 0.278, 0.176, 0.468, 0.62, 0.028, 0.956, 0.22, 0.028, 0.198, 0.586, 0.154, 0.432, 0.562, 0.31, 0.06, 0.634, 0.018, 0.112, 0.298, 0.318, 0.75, 0.584, 0.716, 0.084, 0.592, 0.034, 0.51, 0.274, 0.064, 0.81, 0.708, 0.614, 0.016, 0.054, 0.018, 0.11, 0.902, 0.572, 0.134, 0.132, 0.026, 0.25, 0.254, 0.096, 0.386, 0.118, 0.626, 0.02, 0.62, 0.08, 0.016, 0.756, 0.924, 0.258, 0.112, 0.046, 0.046, 0.538, 0.03, 0.396, 0.082, 0.03, 0.12, 0.496, 0.084, 0.71, 0.754, 0.27, 0.762, 0.608, 0.586, 0.71, 0.06, 0.652, 0.23, 0.26, 0.142, 0.55, 0.706, 0.114, 0.356, 0.008, 0.604, 0.356, 0.076, 0.424, 0.08, 0.532, 0.038, 0.56, 0.024, 0.422, 0.306, 0.042, 0.01, 0.088, 0.444, 0.732, 0.488, 0.024, 0.028, 0.09, 0.48, 0.076, 0.136, 0.416, 0.47, 0.244, 0.252, 0.05, 0.16, 0.03, 0.438, 0.04, 0.068, 0.134, 0.042, 0.656, 0.06, 0.022, 0.934, 0.516, 0.912, 0.186, 0.254, 0.172, 0.472, 0.02, 0.012, 0.522, 0.028, 0.082, 0.488, 0.544, 0.346, 0.024, 0.064, 0.8, 0.594, 0.054, 0.084, 0.262, 0.436, 0.858, 0.858, 0.54, 0.232, 0.014, 0.02, 0.738, 0.406, 0.052, 0.572, 0.026, 0.174, 0.446, 0.46, 0.916, 0.312, 0.346, 0.22, 0.874, 0.028, 0.046, 0.554, 0.04, 0.32, 0.596, 0.046, 0.05, 0.734, 0.04, 0.144, 0.498, 0.042, 0.524, 0.036, 0.052, 0.616, 0.058, 0.496, 0.64, 0.456, 0.468, 0.026, 0.048, 0.034, 0.614, 0.016, 0.022, 0.072, 0.02, 0.524, 0.072, 0.79, 0.166, 0.424, 0.872, 0.524, 0.812, 0.042, 0.754, 0.794, 0.256, 0.03, 0.496, 0.696, 0.018, 0.676, 0.67, 0.434, 0.718, 0.048, 0.068, 0.806, 0.006, 0.176, 0.104, 0.236, 0.008, 0.444, 0.638, 0.008, 0.128, 0.52, 0.762, 0.75, 0.444, 0.432, 0.512, 0.02, 0.706, 0.182, 0.018, 0.304, 0.094, 0.056, 0.384, 0.634, 0.42, 0.188, 0.666, 0.456, 0.022, 0.012, 0.316, 0.082, 0.408, 0.012, 0.376, 0.604, 0.478, 0.018, 0.48, 0.03, 0.164, 0.266, 0.072, 0.018, 0.358, 0.072, 0.81, 0.722, 0.476, 0.498, 0.448, 0.01, 0.62, 0.536, 0.546, 0.612, 0.574, 0.01, 0.454, 0.26, 0.12, 0.354, 0.37, 0.656, 0.246, 0.064, 0.046, 0.35, 0.01, 0.832, 0.2, 0.51, 0.464, 0.516, 0.674, 0.162, 0.508, 0.51, 0.404, 0.602, 0.53, 0.122, 0.028, 0.032, 0.07, 0.146, 0.498, 0.06, 0.358, 0.046, 0.084, 0.044, 0.182, 0.744, 0.016, 0.648, 0.834, 0.084, 0.474, 0.254, 0.152, 0.16, 0.754, 0.006, 0.818, 0.166, 0.078, 0.68, 0.738, 0.06, 0.012, 0.434, 0.408, 0.69, 0.444, 0.484, 0.65, 0.434, 0.33, 0.026, 0.838, 0.02, 0.714, 0.036, 0.724, 0.034, 0.482, 0.188, 0.016, 0.504, 0.5, 0.062, 0.026, 0.804, 0.114, 0.244, 0.63, 0.036, 0.214, 0.49, 0.088, 0.04, 0.304, 0.456, 0.146, 0.764, 0.494, 0.398, 0.022, 0.502, 0.49, 0.004, 0.602, 0.57, 0.692, 0.142, 0.814, 0.064, 0.042, 0.006, 0.724, 0.438, 0.01, 0.02, 0.01, 0.058, 0.112, 0.53, 0.51, 0.072, 0.73, 0.06, 0.352, 0.924, 0.01, 0.234, 0.562, 0.156, 0.304, 0.4, 0.652, 0.942, 0.766, 0.5, 0.414, 0.28, 0.104, 0.014, 0.034, 0.084, 0.788, 0.38, 0.134, 0.098, 0.524, 0.076, 0.036, 0.782, 0.838, 0.692, 0.648, 0.328, 0.01, 0.058, 0.062, 0.916, 0.012, 0.2, 0.372, 0.694, 0.028, 0.006, 0.366, 0.694, 0.794, 0.474, 0.04, 0.406, 0.474, 0.94, 0.05, 0.25, 0.694, 0.444, 0.238, 0.792, 0.028, 0.194, 0.826, 0.272, 0.012, 0.56, 0.112, 0.022, 0.698, 0.112, 0.362, 0.016, 0.366, 0.006, 0.054, 0.102, 0.112, 0.038, 0.038, 0.1, 0.052, 0.05, 0.006, 0.038, 0.036, 0.028, 0.002, 0.518, 0.766, 0.406, 0.044, 0.01, 0.708, 0.254, 0.132, 0.6, 0.89, 0.084, 0.648, 0.052, 0.054, 0.828, 0.37, 0.588, 0.566, 0.38, 0.244, 0.028, 0.646, 0.08, 0.086, 0.48, 0.642, 0.644, 0.198, 0.632, 0.418, 0.234, 0.174, 0.118, 0.628, 0.1, 0.022, 0.768, 0.366, 0.444, 0.014, 0.046, 0.544, 0.476, 0.776, 0.052, 0.598, 0.112, 0.676, 0.02, 0.034, 0.47, 0.754, 0.95, 0.008, 0.04, 0.016, 0.15, 0.516, 0.012, 0.908, 0.762, 0.772, 0.484, 0.748, 0.114, 0.734, 0.464, 0.096, 0.244, 0.578, 0.374, 0.164, 0.466, 0.4, 0.006, 0.078, 0.006, 0.654, 0.566, 0.144, 0.458, 0.058, 0.208, 0.486, 0.032, 0.556, 0.094, 0.006, 0.584, 0.142, 0.034, 0.066, 0.376, 0.242, 0.018, 0.474, 0.538, 0.026, 0.464, 0.088, 0.06, 0.288, 0.382, 0.308, 0.018, 0.318, 0.092, 0.384, 0.252, 0.016, 0.03, 0.45, 0.536, 0.944, 0.038, 0.218, 0.028, 0.428, 0.438, 0.218, 0.086, 0.52, 0.214, 0.058, 0.018, 0.528, 0.174, 0.024, 0.056, 0.434, 0.6, 0.19, 0.024, 0.012, 0.478, 0.13, 0.414, 0.204, 0.654, 0.158, 0.484, 0.072, 0.46, 0.208, 0.12, 0.744, 0.746, 0.082, 0.566, 0.2, 0.02, 0.034, 0.228, 0.286, 0.524, 0.392, 0.45, 0.016, 0.368, 0.804, 0.786, 0.14, 0.064, 0.032, 0.466, 0.014, 0.034, 0.702, 0.108, 0.202, 0.438, 0.936, 0.076, 0.07, 0.472, 0.034, 0.64, 0.62, 0.784, 0.418, 0.178, 0.026, 0.042, 0.004, 0.644, 0.534, 0.056, 0.6, 0.042, 0.75, 0.536, 0.744, 0.016, 0.832, 0.57, 0.232, 0.026, 0.366, 0.072, 0.112, 0.602, 0.208, 0.008, 0.222, 0.406, 0.044, 0.028, 0.562, 0.428, 0.322, 0.014, 0.506, 0.324, 0.496, 0.366, 0.06, 0.614, 0.48, 0.768, 0.036, 0.222, 0.098, 0.022, 0.044, 0.098, 0.126, 0.796, 0.068, 0.118, 0.068, 0.668, 0.05, 0.632, 0.058, 0.03, 0.198, 0.794, 0.56, 0.664, 0.696, 0.014, 0.55, 0.646, 0.128, 0.13, 0.788, 0.01, 0.224, 0.632, 0.026, 0.312, 0.126, 0.392, 0.85, 0.04, 0.658, 0.06, 0.818, 0.386, 0.48, 0.766, 0.034, 0.026, 0.048, 0.834, 0.742, 0.034, 0.01, 0.03, 0.084, 0.034, 0.074, 0.056, 0.764, 0.15, 0.012, 0.77, 0.704, 0.224, 0.052, 0.864, 0.026, 0.47, 0.042, 0.382, 0.012, 0.346, 0.528, 0.142, 0.514, 0.01, 0.732, 0.2, 0.004, 0.598, 0.072, 0.828, 0.518, 0.306, 0.166, 0.716, 0.134, 0.096, 0.398, 0.022, 0.454, 0.844, 0.216, 0.038, 0.404, 0.038, 0.22, 0.01, 0.644, 0.552, 0.75, 0.044, 0.01, 0.06, 0.908, 0.028, 0.536, 0.128, 0.024, 0.186, 0.026, 0.602, 0.054, 0.734, 0.6, 0.674, 0.038, 0.024, 0.418, 0.03, 0.616, 0.016, 0.872, 0.728, 0.698, 0.092, 0.202, 0.378, 0.356, 0.6, 0.022, 0.01, 0.904, 0.156, 0.764, 0.706, 0.02, 0.662, 0.104, 0.348, 0.452, 0.462, 0.108, 0.616, 0.406, 0.036, 0.068, 0.636, 0.536, 0.456, 0.172, 0.36, 0.462, 0.346, 0.718, 0.466, 0.32, 0.412, 0.176, 0.028, 0.83, 0.016, 0.026, 0.616, 0.618, 0.018, 0.022, 0.198, 0.064, 0.82, 0.088, 0.564, 0.018, 0.188, 0.114, 0.946, 0.698, 0.702, 0.038, 0.67, 0.052, 0.174, 0.316, 0.414, 0.69, 0.59, 0.022, 0.156, 0.102, 0.188, 0.074, 0.718, 0.94, 0.59, 0.53, 0.442, 0.102, 0.5, 0.04, 0.372, 0.364, 0.276, 0.136, 0.044, 0.972, 0.476, 0.064, 0.066, 0.788, 0.492, 0.184, 0.164, 0.448, 0.042, 0.714, 0.87, 0.676, 0.464, 0.03, 0.762, 0.102, 0.07, 0.712, 0.284, 0.508, 0.014, 0.064, 0.624, 0.16, 0.166, 0.392, 0.166, 0.036, 0.51, 0.224, 0.42, 0.548, 0.218, 0.356, 0.014, 0.764, 0.52, 0.446, 0.116, 0.55, 0.262, 0.63, 0.226, 0.448, 0.258, 0.83, 0.544, 0.348, 0.016, 0.094, 0.884, 0.1, 0.008, 0.01, 0.464, 0.01, 0.534, 0.32, 0.018, 0.036, 0.016, 0.08, 0.052, 0.068, 0.352, 0.076, 0.47, 0.058, 0.054, 0.388, 0.052, 0.176, 0.746, 0.402, 0.714, 0.322, 0.024, 0.056, 0.126, 0.072, 0.012, 0.448, 0.014, 0.676, 0.012, 0.256, 0.542, 0.01, 0.62, 0.026, 0.19]"
+
+$user
+$user$url
+[1] "http://46.101.121.83/group/8/"
+
+$user$username
+[1] "Error_Loading"
+
+$user$best_score
+[1] 0.8727
+
+$user$students
+[1] "2019702147;2019702027;2019702126"
+
+
+$competition
+[1] "IE582-Test Data"
+
+$auc
+[1] 0.9075592
+
+$ber
+[1] 0.8378372
+
+$score
+[1] 0.8726982
+
+$date
+[1] "2021-02-15T11:48:13.411229+03:00"
+
+
+
+
+
+# References
+
+
+[1] “Analytics Vidhya”. (2016). Practical Guide to deal with Imbalanced Classification Problems in R. Analytics Vidhya. (LINK)[https://www.analyticsvidhya.com/blog/2016/03/practical-guide-deal-imbalanced-classification-problems/]
+
+[2] Barandela, R., Valdovinos, R. M., Sánchez, J. S., & Ferri, F. J. (2004). The Imbalanced Training Sample Problem: Under or over Sampling? Structural, Syntactic, and Statistical Pattern Recognition, 806–814. doi:10.1007/978-3-540-27868-9_88
+
+[3] Brownlee, Jason. (2019). A Gentle Introduction to Imbalanced Classification. Machine Learning Mastery. (LINK)[https://machinelearningmastery.com/what-is-imbalanced-classification/]
+
+[4] Chawla, N. V., Bowyer, K. W., Hall, L. O., and Kegelmeyer, W. P. (2002). Smote: Synthetic minority over-sampling technique. Journal of Artificial Intelligence Research, 16:321-357.
+
+

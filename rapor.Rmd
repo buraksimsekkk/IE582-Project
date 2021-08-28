@@ -1,0 +1,294 @@
+---
+title: "Project Report IE 582"
+author: "Error_Loading"
+date: "1/26/2021"
+output: 
+  html_document:
+      toc: true
+      toc_depth: 3
+      number_sections: true
+      code_folding: hide
+          
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, conflict=FALSE, warning=FALSE, message=FALSE, error = FALSE, comment = FALSE)
+```
+
+# Introduction
+Problem description, summary of the proposed approach, descriptive
+analysis of the given data.
+
+```{r libraries}
+library(caret)
+library(dplyr)
+library(corrplot)
+library(data.table)
+library(glmnet)
+library(rpart)
+library(TunePareto)
+library(randomForest)
+library(tidyverse)
+library(ggplot2)
+library(pROC)
+library(ROSE)
+library(skimr)
+```
+First we import the required libraries. 
+
+```{r dataset}
+train_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTrain.csv?token=ARPECO7AB6WXAJW43DSU3UTAE2PM2")
+test_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTest.csv?token=ARPECOY333BAS6PBRVBWGPLAE2POQ")
+```
+Then we import the datasets given for this project. Here we have separate train and test sets, we call them `train_raw` and `test_raw`. Our aim is to find a binary classification model using train set and make predictions on test set. Then we will submit our prediction and see whether the model is working well or not. 
+
+```{r characteristics}
+glimpse(train_raw)
+skim(train_raw)
+skim(test_raw)
+
+colns <- colnames(train)
+cts_features <- c("x1", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x14", "x27", "x30", "x32", "x36", "x42")
+categorical_features <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x37", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x57", "x58", "x59", "x60")
+categorical_features_y <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x37", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x57", "x58", "x59", "x60", "y")
+
+# train x50 ve x52 zero column, no variation, nothing to learn
+# test x50 ve x52 not zero but cannot predict if not learned
+#so drop them
+train <- train_raw %>% select(-x50, -x52)
+X_test_submission <- test_raw %>% select(-x50, -x52, -y)
+
+```
+Using glimpse and skim functions on the train set, we see the characteristics of the features. Skim function shows that there are no missing values in both train and test set, this is good since NA values may create problems in some models. Train set has the feature columns and the target column but the test set does not have the target column. Therefore, the only way to understand if a model is good or not is to using train set as the only data we are given. In other words, we will use train data to create train-test split.
+
+We have `r length(colns)` features in total where `r length(cts_features)` of them are continuous and `r length(categorical_features)` of them are categorical. Skim function shows that continuous features are in different ranges. So they should be scaled. Categorical features are all binary. Also features x50 and x52 have zero standard deviation in the train set. When we look at the values, they are all zero for all the instances in the train set. This means that whichever model is used, it is not possible to learn any information from these two features. Therefore it could be wise to eliminate them in both train and test sets. 
+
+```{r imbalance}
+class_dist<-train_raw %>% group_by(y) %>% summarize(count=n()) 
+ggplot(train_raw, aes(x=y)) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7))
+```
+
+Since this is a binary classification problem, we would like to see the percentages of each class in the target. The classes are called "a" and "b", where there are `r class_dist[1,2]` many a's and `r class_dist[2,2]` many b's. So nearly `r round(100*class_dist[1,2]/(class_dist[1,2]+class_dist[2,2]),0)` of the data has target value "a". Therefore, the problem is an imbalanced classification problem. 
+
+
+```{r factorization}
+# factorization of the categorical features
+train_categorical <- train_large %>% select(categorical_features_y)
+train_categorical <- lapply(train_categorical, as.factor)
+
+X_test_submission_categorical <- X_test_submission %>% select(all_of(categorical_features))
+X_test_submission_categorical <- lapply(X_test_submission_categorical, factor)
+
+train_cts <- train %>% select(-y) %>% select(all_of(cts_features))
+X_test_cts <-X_test_submission %>% select(all_of(cts_features))
+
+train_large <- cbind(as.data.table(train_cts), as.data.table(train_categorical))
+final_train <- train_large
+X_test_submission <- cbind(as.data.table(X_test_cts), as.data.table(X_test_submission_categorical))
+
+```
+
+
+
+```{r smote}
+#Ovun with imbalance
+
+set.seed(50)
+train_inds <- createDataPartition(y = 1:nrow(train_large), p = 0.8, list = F)
+test <- train_large[-train_inds, ]
+train <- train_large[train_inds, ]
+
+train_smote <- ovun.sample(y~., data=train, p=0.5, seed=1, method="over")$data
+table(train_smote$y)
+X_train_smote <- train_smote %>% select(-y)
+y_train_smote <- train_smote %>% select(y)
+
+X_test <- test %>% select(-y)
+y_test <- test %>% select(y)
+
+
+final_train_smote <- ovun.sample(y~., data=final_train, p=0.5, seed=1, method="over")$data
+X_final_train_smote <- final_train_smote %>% select(-y)
+y_final_train_smote <- final_train_smote %>% select(y)
+
+
+
+
+```
+
+
+
+```{r manipulation}
+
+# scaling the continous features
+#train_cts_scaled <- train %>% select(-y) %>% select(cts_features) %>% scale()
+
+#X_test_cts_scaled <-X_test_submission %>% select(cts_features) %>% scale()
+
+#Correlation check
+#corrplot(cor(train_cts_scaled, method = c("pearson")))
+#corrplot(cor(X_test_cts_scaled, method = c("pearson")))
+
+
+
+
+# scaled and factored
+#trainn <- cbind(as.data.table(train_cts_scaled), as.data.table(train_categorical))
+#final_train <- trainn
+#X_test_submission <- cbind(as.data.table(X_test_cts_scaled), as.data.table(X_test_submission_categorical))
+```
+
+
+# Approach
+Explain your approach to this problem.
+
+We will fit the model on `train_smote` which is factorized and balanced. Then we will predict using `train_smote` and `test` in order to compare their balanced accuracy results. Here `test` is imbalanced. If we think the model is good enough then we will fit the model on `final_train_smote` and make predictions on `X_test_submission`. 
+
+
+# Results
+Provide your results and discussion.
+
+```{r pra_model}
+## ovunsample over PRA subm %84.84
+
+## PRA 809-802 seed280 
+set.seed(280)
+fitControl <- trainControl(method = "repeatedcv", number = 10, verboseIter = TRUE, classProbs = TRUE)
+tunegrid <- expand.grid(alpha = 1,lambda = seq(0.001,0.1,by = 0.001))
+model_pra <- train(y~., data=train_smote, method="glmnet", trControl = fitControl, tuneGrid = tunegrid)
+
+pred_pra <- predict(model_pra, newx=test)
+
+cm_pra_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_pra_train <- confusionMatrix(factor(predict(model_pra, newx=data.matrix(X_train_smote), s=c("lambda.min"), type = "class")), train_smote$y)
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+
+
+############    0.8484
+
+model_pra<-cv.glmnet(data.matrix(X_final_train_smote), final_train_smote$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test_submission), s=c("lambda.min"), type = "class")
+```
+
+
+# Conclusions and Future Work
+Summarize your findings and comments regarding your
+approach. What are possible extensions to have a better approach?
+
+
+# Code
+The Github link for the codes is (HERE)[].
+
+# Submission Codes
+
+```{r submission_functions}
+require(jsonlite)
+require(httr)
+require(data.table)
+
+get_token <- function(username, password, url_site){
+    
+    post_body = list(username=username,password=password)
+    post_url_string = paste0(url_site,'/token/')
+    result = POST(post_url_string, body = post_body)
+
+    # error handling (wrong credentials)
+    if(result$status_code==400){
+        print('Check your credentials')
+        return(0)
+    }
+    else if (result$status_code==201){
+        output = content(result)
+        token = output$key
+    }
+
+    return(token)
+}
+
+send_submission <- function(predictions, token, url_site, submit_now=F){
+    
+    format_check=check_format(predictions)
+    if(!format_check){
+        return(FALSE)
+    }
+    
+    post_string="list("
+    for(i in 1:length(predictions)){
+        if(i<length(predictions)){
+            post_string=sprintf("%s%s,",post_string,predictions[i])
+        } else {
+            post_string=sprintf("%s%s)",post_string,predictions[i])
+        }
+    }
+    
+    submission = eval(parse(text=post_string))
+    json_body = jsonlite::toJSON(submission, auto_unbox = TRUE)
+    submission=list(submission=json_body)
+    print(submission)
+
+    if(!submit_now){
+        print("You did not submit.")
+        return(FALSE)      
+    }
+    
+
+    header = add_headers(c(Authorization=paste('Token',token,sep=' ')))
+    post_url_string = paste0(url_site,'/submission/')
+    result = POST(post_url_string, header, body=submission)
+    
+    if (result$status_code==201){
+        print("Successfully submitted. Below you can see the details of your submission")
+    } else {
+        print("Could not submit. Please check the error message below, contact the assistant if needed.")
+    }
+    
+    print(content(result))
+    
+}
+
+check_format <- function(predictions){
+    
+    if(all(is.numeric(predictions)) & all(predictions<=1)){
+        print("Format OK")
+        return(TRUE)
+    } else {
+        print("Wrong format")
+        return(FALSE)
+    }
+    
+}
+```
+
+
+```{r submission}
+# this part is main code
+subm_url = 'http://46.101.121.83'
+
+u_name = "Error_Loading"
+p_word = "UHAxWUfYKVZNQmgq"
+submit_now = FALSE
+
+username = u_name
+password = p_word
+
+
+token = get_token(username=u_name, password=p_word, url=subm_url)
+## this part is where you need to provide your prediction method/function or set of R codes
+## predictions=runif(2073) type double olduğu için çevirdim
+
+pred <- pred_pra
+
+pred_dummy <- mlr::createDummyFeatures(pred, pred, method="reference")
+
+frame <- as.matrix(pred_dummy)
+
+predictions <- frame
+
+send_submission(predictions, token, url=subm_url, submit_now= submit_now)
+```

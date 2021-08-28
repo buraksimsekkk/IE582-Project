@@ -1,0 +1,50 @@
+---
+title: "Project_582"
+author: "Error_Loading"
+date: "1/26/2021"
+output: 
+  html_document:
+      toc: true
+      toc_depth: 3
+      number_sections: true
+      code_folding: hide
+          
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, conflict=FALSE, warning=FALSE, message=FALSE, error = FALSE, comment = FALSE)
+```
+
+Class Imbalance in Classification Problem
+
+Class imbalance is the situation where a class of predicted variable is significantly higher than the other one/s. In binary classification case class with higher number of observations is called “majority class” and the other is called “minority class.” This is a common problem in real life data where a class may naturally dominate the other ones, or it may be a result of biased sampling or measurement errors (Brownlee, 2019). This class imbalance problems have to dealt in order Machine Learning algorithms to perform better on prediction accuracy.
+There are various methods to deal with class imbalance and the ones considered in this study are over-sampling, under-sampling and Synthetic Minority Over-sampling Technique (SMOTE). Each of these methods follows a different approach to balance the number of observations among classes (Barandela et al., 2004).
+
+
+Over-sampling
+
+Over-sampling is basically replicating observations from the minority class using different methods. Using Nearest Neighbor approach on the minority data an amount of artificial observation is created and added to the dataset in order to balance the class distributions (Barandela et al., 2004). Creation of new data can be done randomly or by “informative sampling” using  “pre-defined criterion” to obtain new data for the minority class.
+One great advantage of over-sampling is that no data is lost, so there will not be any loss of information due to data removed. On the other hand, obtaining new observations from the minority data by replicating them following a pattern may cause overfitting (“Analytics Vidhya”, 2016). These advantage and disadvantage have to be discussed thoroughly before implementing the method.
+
+
+Under-sampling
+
+Under-sampling is again basically removing observations from the majority class in order to balance the class distributions in the dataset. Removing observations from the original data eventually causes loss of information so there are some algorithms developed to reduce the loss of significant information while removing samples from the data. Wilson’s Editing, Weighted Editing and The Modified Selective Subsets are some algorithms focusing on removing the observations with minimum loss of significant information (Barandela et al., 2004).
+One important disadvantage of under-sampling is loss of information and training the model with less data. This may lead to lower accuracy of prediction in the final predictive model. “ovun.sample()” function in “ROSE” package can be used to implement both over- and under- sampling in R.
+
+
+Synthetic Minority Over-sampling Technique (SMOTE)
+
+SMOTE is a method which integrates the previously discussed methods, over-sampling and under-sampling. The majority class is under-sampled, and the minority class is over-sampled to a level which optimizes the loss of information and overfitting. SMOTE proposes an over-sampling approach of creating “synthetic” instead of over-sampling by replacement (Chawla et al., 2002). Chawla et al. states that SMOTE gives better ROC results in various datasets (2002).
+“SMOTE” function in “smotefamily” package can be used to implement this method in R.
+
+
+References
+
+“Analytics Vidhya”. (2016). Practical Guide to deal with Imbalanced Classification Problems in R. Analytics Vidhya. https://www.analyticsvidhya.com/blog/2016/03/practical-guide-deal-imbalanced-classification-problems/
+
+Barandela, R., Valdovinos, R. M., Sánchez, J. S., & Ferri, F. J. (2004). The Imbalanced Training Sample Problem: Under or over Sampling? Structural, Syntactic, and Statistical Pattern Recognition, 806–814. doi:10.1007/978-3-540-27868-9_88
+
+Brownlee, Jason. (2019). A Gentle Introduction to Imbalanced Classification. Machine Learning Mastery. https://machinelearningmastery.com/what-is-imbalanced-classification/
+
+Chawla, N. V., Bowyer, K. W., Hall, L. O., and Kegelmeyer, W. P. (2002). Smote: Synthetic minority over-sampling technique. Journal of Artificial Intelligence Research, 16:321-357.

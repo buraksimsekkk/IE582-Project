@@ -1,0 +1,634 @@
+---
+title: "Project_582"
+author: "Error_Loading"
+date: "1/26/2021"
+output: 
+  html_document:
+      toc: true
+      toc_depth: 3
+      number_sections: true
+      code_folding: hide
+          
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, conflict=FALSE, warning=FALSE, message=FALSE, error = FALSE, comment = FALSE)
+```
+
+# Introduction
+Problem description, summary of the proposed approach, descriptive
+analysis of the given data.
+
+```{r submission_functions_dont_touch}
+require(jsonlite)
+require(httr)
+require(data.table)
+
+get_token <- function(username, password, url_site){
+    
+    post_body = list(username=username,password=password)
+    post_url_string = paste0(url_site,'/token/')
+    result = POST(post_url_string, body = post_body)
+
+    # error handling (wrong credentials)
+    if(result$status_code==400){
+        print('Check your credentials')
+        return(0)
+    }
+    else if (result$status_code==201){
+        output = content(result)
+        token = output$key
+    }
+
+    return(token)
+}
+
+send_submission <- function(predictions, token, url_site, submit_now=F){
+    
+    format_check=check_format(predictions)
+    if(!format_check){
+        return(FALSE)
+    }
+    
+    post_string="list("
+    for(i in 1:length(predictions)){
+        if(i<length(predictions)){
+            post_string=sprintf("%s%s,",post_string,predictions[i])
+        } else {
+            post_string=sprintf("%s%s)",post_string,predictions[i])
+        }
+    }
+    
+    submission = eval(parse(text=post_string))
+    json_body = jsonlite::toJSON(submission, auto_unbox = TRUE)
+    submission=list(submission=json_body)
+    print(submission)
+
+    if(!submit_now){
+        print("You did not submit.")
+        return(FALSE)      
+    }
+    
+
+    header = add_headers(c(Authorization=paste('Token',token,sep=' ')))
+    post_url_string = paste0(url_site,'/submission/')
+    result = POST(post_url_string, header, body=submission)
+    
+    if (result$status_code==201){
+        print("Successfully submitted. Below you can see the details of your submission")
+    } else {
+        print("Could not submit. Please check the error message below, contact the assistant if needed.")
+    }
+    
+    print(content(result))
+    
+}
+
+check_format <- function(predictions){
+    
+    if(all(is.numeric(predictions)) & all(predictions<=1)){
+        print("Format OK")
+        return(TRUE)
+    } else {
+        print("Wrong format")
+        return(FALSE)
+    }
+    
+}
+```
+
+
+```{r libraries}
+#importing the libraries
+library(caret)
+library(dplyr)
+library(corrplot)
+library(data.table)
+library(glmnet)
+library(rpart)
+library(TunePareto)
+library(randomForest)
+library(tidyverse)
+library(ggplot2)
+library(pROC)
+library(ROSE)
+```
+
+```{r dataset_manip}
+train_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTrain.csv?token=ANPOH4IJOQLOLAD4XZY5ODTAFOXIC")
+test_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTest.csv?token=ANPOH4JMDTUCP6TB4RWTZSTAFOXFY")
+
+#no NA values, good
+train_raw %>% summarise_all(~ sum(is.na(.))) 
+test_raw %>% summarise_all(~ sum(is.na(.))) 
+
+#to see the imbalance
+train_raw %>% group_by(y) %>% summarize(count=n()) 
+#ggplot(train_raw, aes(x=y )) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7) )
+
+# train x50 ve x52 zero column, no variation, nothing to learn
+# test x50 ve x52 zero değil ama öğrenmediğini predict edemez
+# droplamak durumundayız
+train <- train_raw %>% select(-x50, -x52)
+X_test_submission <- test_raw %>% select(-x50, -x52, -y)
+
+#create_dummy <- dummyVars("~ .", data=train, fullRank = T)
+#train <- data.frame(predict(create_dummy, newdata = train))
+#train_dummy$yb <- as.factor(train_dummy$yb)
+
+# cts olanlar ayrılıp scale edip cbind edilecek - X_test_submission ve train için, diğerleri factor yapılacak
+colns <- colnames(train)
+cts_features <- c("x1", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x14", "x27", "x30", "x32", "x36", "x42")
+categorical_features <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x37", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x57", "x58", "x59", "x60")
+categorical_features_y <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x37", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x57", "x58", "x59", "x60", "y")
+
+# normalization
+train_cts <- train %>% select(-y) %>% select(cts_features)
+normalization <- preProcess(train_cts, method=c("center", "scale"))
+train_cts_normalized <- predict(normalization, train_cts)
+
+X_test_submission_cts <- X_test_submission %>% select(cts_features)
+normalization <- preProcess(X_test_submission_cts, method=c("center", "scale"))
+X_test_cts_normalized <- predict(normalization, X_test_submission_cts)
+
+# factorization
+train_categorical <- train %>% select(categorical_features_y)
+train_categorical <- lapply(train_categorical, factor)
+
+X_test_submission_categorical <- X_test_submission %>% select(categorical_features)
+X_test_submission_categorical <- lapply(X_test_submission_categorical, factor)
+
+# normalized and factored
+trainn <- cbind(train_cts_normalized, train_categorical)
+final_train <- trainn
+X_test_submission <- cbind(X_test_cts_normalized, X_test_submission_categorical)
+
+#Correlation check
+corrplot(cor(train_cts_normalized, method = c("pearson")))
+corrplot(cor(X_test_submission_cts, method = c("pearson")))
+
+set.seed(50)
+train_inds <- createDataPartition(y = 1:nrow(trainn), p = 0.8, list = F)
+test <- trainn[-train_inds, ]
+train <- trainn[train_inds, ]
+
+X_train <- train %>% select(-y)
+y_train <- train %>% select(y)
+X_test <- test %>% select(-y)
+y_test <- test %>% select(y)
+```
+
+```{r smote}
+## PRA 76 test, 85 train, 0.8310786 test_submission
+## RF 77-99
+
+#Deal with imbalance
+train_smote <- DMwR::SMOTE(y ~ ., train, k=5, perc.over = 100, perc.under=200)
+ggplot(train_smote, aes(x=y)) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7))
+X_train_smote <- train_smote %>% select(-y)
+y_train_smote <- train_smote %>% select(y)
+#train test e göre model beğendik ama 
+#final modeli oturturken tüm traini kullanalım ki çok data ile öğrensin
+final_train_smote <- DMwR::SMOTE(y ~ ., final_train, perc.over = 100, perc.under=200)
+X_final_train_smote <- final_train_smote %>% select(-y)
+y_final_train_smote <- final_train_smote %>% select(y)
+#sonra X_test_submission dan predict edip submit etcez
+
+## PRA
+## 76 test, 85 train
+model_pra<-cv.glmnet(data.matrix(X_train_smote), train_smote$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test), s=c("lambda.min"), type = "class")
+
+cm_pra_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_pra_train <- confusionMatrix(factor(predict(model_pra, newx=data.matrix(X_train_smote), s=c("lambda.min"), type = "class")), train_smote$y)
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+
+
+############    0.8310786
+
+model_pra<-cv.glmnet(data.matrix(X_final_train_smote), final_train_smote$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test_submission), s=c("lambda.min"), type = "class")
+
+###########
+
+
+## RF 77-99
+m=c(4,6,8)
+#for balanced folds: stratified =TRUE
+# ntree is J=500 given in hw
+J=500 
+# the minimal number of observations per tree leaf is nodesize 5 given in hw
+min_size_of_terminal_nodes=5
+n_folds=10
+fitControl=trainControl(method = "repeatedcv", number = n_folds, repeats = 1, classProbs = TRUE, search="random", savePred=TRUE)   
+rf_grid<-expand.grid(mtry = m)
+
+model_RF <- train(y ~ ., data = train_smote, method = "rf", trControl = fitControl, ntree=J, nodesize = min_size_of_terminal_nodes, tuneGrid = rf_grid)
+
+pred_RF <- predict(model_RF, newdata=X_test)
+
+cm_RF_test <- confusionMatrix(factor(pred_RF), test$y)
+cm_RF_train <- confusionMatrix(factor(predict(model_RF, newdata=X_train_smote)), train_smote$y)
+
+
+#ranger
+
+fitControl <- trainControl(method = "repeatedcv", number = 10, verboseIter = TRUE, classProbs = TRUE)
+rf_grid<-expand.grid(mtry = c(3, 5, 7, 11, 15), splitrule = c("gini", "extratrees"), min.node.size = c(3, 5, 7))
+model_RF<-train(y ~ ., data = train_smote, method = "ranger", trControl = fitControl, num.trees=250, tuneGrid = rf_grid)
+
+pred_RF <- predict(model_RF, newdata=X_test)
+
+cm_RF_test <- confusionMatrix(factor(pred_RF), test$y)
+cm_RF_train <- confusionMatrix(factor(predict(model_RF, newdata=X_train_smote)), train_smote$y)
+
+balanced_accuracy_train <- cm_RF_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_RF_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+
+
+rf_grid<-expand.grid(mtry = c(3, 5, 7, 11, 15), splitrule = c("gini", "extratrees"), min.node.size = c(3, 5, 7))
+model_RF<-train(y ~ ., data = final_train_smote, method = "ranger", trControl = fitControl, num.trees=250, tuneGrid = rf_grid)
+
+cm_pra_train <- confusionMatrix(factor(predict(model_RF, newdata=X_final_train_smote)), factor(final_train_smote$y))
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+print(balanced_accuracy_train)
+
+pred_RF <- predict(model_RF, newdata=X_test_submission)
+
+
+```
+
+
+```{r ovun.sample_1}
+## PRA 0.78 test, 0.81 train
+## RF 0.78 test, 0.99 train, submission .78
+## DT 74 test, 81 train
+## SGB 79 test, 89 train, submission .72
+
+train %>% group_by(y) %>% summarize(count=n()) 
+train_balanced_over <- ovun.sample(y ~ ., data=train, method = "over")$data
+train_balanced_over %>% group_by(y) %>% summarize(count=n()) 
+ggplot(train_balanced_over, aes(x=y)) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7))
+
+X_train_balanced_over <- train_balanced_over %>% select(-y)
+y_train_balanced_over <- train_balanced_over %>% select(y)
+
+#Final modeli oturturken
+final_train_balanced_over <- ovun.sample(y ~ ., data=final_train, method = "over")$data
+X_final_train_balanced_over <- final_train_balanced_over %>% select(-y)
+y_final_train_balanced_over <- final_train_balanced_over %>% select(y)
+
+
+## PRA
+## PRA 0.78 test, 0.81 train
+model_pra<-cv.glmnet(data.matrix(X_train_balanced_over), train_balanced_over$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test), s=c("lambda.min"), type = "class")
+
+cm_pra_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_pra_train <- confusionMatrix(factor(predict(model_pra, newx=data.matrix(X_train_balanced_over), s=c("lambda.min"), type = "class")), train_balanced_over$y)
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+
+
+## RF 
+## RF 0.78 test, 0.99 train
+m=c(4,6,8)
+#for balanced folds: stratified =TRUE
+# ntree is J=500 given in hw
+J=500 
+# the minimal number of observations per tree leaf is nodesize 5 given in hw
+min_size_of_terminal_nodes=5
+n_folds=10
+fitControl=trainControl(method = "repeatedcv", number = n_folds, repeats = 1, classProbs = TRUE, search="random", savePred=TRUE)   
+rf_grid<-expand.grid(mtry = m)
+
+model_RF <- train(y ~ ., data = train_balanced_over, method = "rf", trControl = fitControl, ntree=J, nodesize = min_size_of_terminal_nodes, tuneGrid = rf_grid)
+
+pred_RF <- predict(model_RF, newdata=X_test)
+
+cm_RF_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_RF_train <- confusionMatrix(factor(predict(model_RF, newdata=X_train_balanced_over)), train_balanced_over$y)
+
+
+model_RF <- train(y ~ ., data = final_train_balanced_over, method = "rf", trControl = fitControl, ntree=J, nodesize = min_size_of_terminal_nodes, tuneGrid = rf_grid)
+
+pred_RF <- predict(model_RF, newdata=X_test_submission)
+
+
+## DT
+## 74 test, 81 train
+set.seed(50)
+complexity=c(0.01,0.03,0.05)
+min_number_of_observations=c(10,15,25)
+cv_summary=data.table()
+
+#for balanced folds: stratified =TRUE
+index <- generateCVRuns(train_balanced_over$y, ntimes=1, nfold=10, stratified =TRUE)
+acc <- 0
+best_complexity <- 0
+best_min_number_of_observations <- 0
+for(i in 1:10){
+  for(c in complexity){
+    for(m in min_number_of_observations){
+      test_index <- index$`Run  1`[i]
+      train_cv <- train_balanced_over[-test_index[[1]],]
+      test_cv <- train_balanced_over[test_index[[1]],]
+      fitControl <- rpart.control(cp = c, minbucket = m)  
+      model_DT=rpart(y~., train_balanced_over, control=fitControl)
+      pred <- predict(model_DT, test_cv, type="class")
+      cm <- confusionMatrix(pred, factor(test_cv$y))
+      acc_temp <- cm$overall[1:1]
+      cv_summary <- rbind(cv_summary,data.table(Fold=i, Complexity=c, Min_Observations_per_Leaf=m, Accuracy=acc_temp))
+
+      if(acc_temp>acc){
+        acc<-acc_temp
+        best_complexity <- c
+        best_min_number_of_observations <- m
+      }
+    }
+  }
+}
+
+cv_summary <- cv_summary %>% group_by(Complexity, Min_Observations_per_Leaf) %>% summarise(mean_accuracy = mean(Accuracy))
+print(cv_summary)
+
+fitControl <- rpart.control(cp = best_complexity, minbucket = best_min_number_of_observations)
+model_DT <- rpart(y~., train_balanced_over, control=fitControl)
+pred_DT <- predict(model_DT, X_test, type="class")
+
+cm_DT_test <- confusionMatrix(factor(pred_DT), factor(test$y))
+
+cm_DT_train <- confusionMatrix(factor(predict(model_DT, X_train_balanced_over, type="class")), factor(y_train_balanced_over$y))
+
+
+## SGB
+## 79 test, 89 train
+set.seed(20)
+n_folds <- 10
+fitControl <- trainControl(method = "cv", number = n_folds, classProbs = TRUE)  
+
+gbmGrid_forever <-  expand.grid(interaction.depth = c(1, 5, 7), n.trees = c(50,100,200), shrinkage = c(0.05, 0.1, 0.2), n.minobsinnode = c(10))
+
+gbmGrid <-  expand.grid(interaction.depth = c(5), n.trees = c(100), shrinkage = c(0.1), n.minobsinnode = c(10))
+
+final_train_balanced_overr <- final_train_balanced_over %>% select(-x37)
+model_sgb <- train(y ~ ., data = data.frame(final_train_balanced_overr), method = "gbm", trControl = fitControl, tuneGrid = gbmGrid_forever, verbose=F)
+#The final values used for the model were n.trees = 200, interaction.depth = 7, shrinkage = 0.2
+pred_sgb <- predict(model_sgb, newdata=X_test_submission) %>% as.matrix()
+
+
+
+cm_sgb_test <- confusionMatrix(factor(pred_sgb), factor(y_test$y))
+
+cm_sgb_train <- confusionMatrix(factor(predict(model_sgb, newdata=X_train_balanced_over)), factor(y_train_balanced_over$y))
+```
+
+```{r ovun.sample_2000}
+## PRA 0.76 test, 0.80 train
+## RF 0.76 test, 0.99 train
+train_balanced_over_2000 <- ovun.sample(y ~ ., data=train, method = "over", N=2000)$data
+train_balanced_over_2000 %>% group_by(y) %>% summarize(count=n()) 
+ggplot(train_balanced_over_2000, aes(x=y)) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7))
+
+X_train_balanced_over_2000 <- train_balanced_over_2000 %>% select(-y)
+y_train_balanced_over_2000 <- train_balanced_over_2000 %>% select(y)
+
+#Final modeli oturturken
+final_train_balanced_over_2000 <- ovun.sample(y ~ ., data=final_train, method = "over")$data
+X_final_train_balanced_over_2000 <- final_train_balanced_over_2000 %>% select(-y)
+y_final_train_balanced_over_2000 <- final_train_balanced_over_2000 %>% select(y)
+
+
+## PRA
+## 0.76 test, 0.80 train
+model_pra<-cv.glmnet(data.matrix(X_train_balanced_over_2000), train_balanced_over_2000$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test), s=c("lambda.min"), type = "class")
+
+cm_pra_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_pra_train <- confusionMatrix(factor(predict(model_pra, newx=data.matrix(X_train_balanced_over_2000), s=c("lambda.min"), type = "class")), train_balanced_over_2000$y)
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+```
+
+```{r ovun.sample_3000}
+## PRA 0.77 test, 0.82 train
+## RF yukarda overfitting yaptığı için denemedik bile
+train_balanced_over_2000 <- ovun.sample(y ~ ., data=train, method = "over", N=3000)$data
+train_balanced_over_2000 %>% group_by(y) %>% summarize(count=n()) 
+ggplot(train_balanced_over_2000, aes(x=y)) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7))
+
+X_train_balanced_over_2000 <- train_balanced_over_2000 %>% select(-y)
+y_train_balanced_over_2000 <- train_balanced_over_2000 %>% select(y)
+
+#Final modeli oturturken
+final_train_balanced_over_2000 <- ovun.sample(y ~ ., data=final_train, method = "over")$data
+X_final_train_balanced_over_2000 <- final_train_balanced_over_2000 %>% select(-y)
+y_final_train_balanced_over_2000 <- final_train_balanced_over_2000 %>% select(y)
+
+
+## PRA
+## 0.76 test, 0.80 train
+model_pra<-cv.glmnet(data.matrix(X_train_balanced_over_2000), train_balanced_over_2000$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test), s=c("lambda.min"), type = "class")
+
+cm_pra_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_pra_train <- confusionMatrix(factor(predict(model_pra, newx=data.matrix(X_train_balanced_over_2000), s=c("lambda.min"), type = "class")), train_balanced_over_2000$y)
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+```
+
+
+
+
+
+```{r pra}
+model_pra<-cv.glmnet(data.matrix(X_train_balanced_over_2000), train_balanced_over_2000$y, type.measure = "class", family="binomial", nfolds=10)
+
+pred_pra <- predict(model_pra, newx=data.matrix(X_test), s=c("lambda.min"), type = "class")
+
+cm_pra_test <- confusionMatrix(factor(pred_pra), test$y)
+cm_pra_train <- confusionMatrix(factor(predict(model_pra, newx=data.matrix(X_train_balanced_over_2000), s=c("lambda.min"), type = "class")), train_balanced_over_2000$y)
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_train)
+print(balanced_accuracy_test)
+
+```
+
+```{r random_forest}
+
+m=c(4,6,8)
+#for balanced folds: stratified =TRUE
+# ntree is J=500 given in hw
+J=500 
+# the minimal number of observations per tree leaf is nodesize 5 given in hw
+min_size_of_terminal_nodes=5
+n_folds=10
+fitControl=trainControl(method = "repeatedcv", number = n_folds, repeats = 1, classProbs = TRUE, search="random", savePred=TRUE)   
+rf_grid<-expand.grid(mtry = m)
+
+model_RF <- train(y ~ ., data = train_smote, method = "rf", trControl = fitControl, ntree=J, nodesize = min_size_of_terminal_nodes, tuneGrid = rf_grid)
+
+pred_RF <- predict(model_RF, newdata=X_test)
+
+cm_RF_test <- confusionMatrix(factor(pred_RF), test$y)
+cm_RF_train <- confusionMatrix(factor(predict(model_RF, newdata=X_train_smote)), train_smote$y)
+
+```
+
+```{r decision_tree}
+set.seed(50)
+complexity=c(0.01,0.03,0.05)
+min_number_of_observations=c(10,15,25)
+cv_summary=data.table()
+
+#for balanced folds: stratified =TRUE
+index <- generateCVRuns(train_balanced_over$y, ntimes=1, nfold=10, stratified =TRUE)
+acc <- 0
+best_complexity <- 0
+best_min_number_of_observations <- 0
+for(i in 1:10){
+  for(c in complexity){
+    for(m in min_number_of_observations){
+      test_index <- index$`Run  1`[i]
+      train_cv <- train_balanced_over[-test_index[[1]],]
+      test_cv <- train_balanced_over[test_index[[1]],]
+      fitControl <- rpart.control(cp = c, minbucket = m)  
+      model_DT=rpart(y~., train_balanced_over, control=fitControl)
+      pred <- predict(model_DT, test_cv, type="class")
+      cm <- confusionMatrix(pred, factor(test_cv$y))
+      acc_temp <- cm$overall[1:1]
+      cv_summary <- rbind(cv_summary,data.table(Fold=i, Complexity=c, Min_Observations_per_Leaf=m, Accuracy=acc_temp))
+
+      if(acc_temp>acc){
+        acc<-acc_temp
+        best_complexity <- c
+        best_min_number_of_observations <- m
+      }
+    }
+  }
+}
+
+cv_summary <- cv_summary %>% group_by(Complexity, Min_Observations_per_Leaf) %>% summarise(mean_accuracy = mean(Accuracy))
+print(cv_summary)
+
+fitControl <- rpart.control(cp = best_complexity, minbucket = best_min_number_of_observations)
+model_DT <- rpart(y~., train_balanced_over, control=fitControl)
+pred_DT <- predict(model_DT, X_test, type="class")
+
+cm_DT_test <- confusionMatrix(factor(pred_DT), factor(test$y))
+
+cm_DT_train <- confusionMatrix(factor(predict(model_DT, X_train_balanced_over, type="class")), factor(y_train_balanced_over$y))
+```
+
+```{r sgb}
+set.seed(20)
+n_folds <- 10
+fitControl <- trainControl(method = "cv", number = n_folds)  
+
+gbmGrid_forever <-  expand.grid(interaction.depth = c(1, 5, 7), n.trees = c(50,100,200), shrinkage = c(0.05, 0.1, 0.2), n.minobsinnode = c(10))
+
+gbmGrid <-  expand.grid(interaction.depth = c(5), n.trees = c(100), shrinkage = c(0.1), n.minobsinnode = c(10))
+
+train_balanced_overr <- train_balanced_over %>% select(-x37)
+model_sgb=train(y ~ ., data = data.frame(train_balanced_overr), method = "gbm", trControl = fitControl, tuneGrid = gbmGrid, verbose=F)
+
+pred_sgb <- predict(model_sgb, newdata=X_test) %>% as.matrix()
+
+cm_sgb_test <- confusionMatrix(factor(pred_sgb), factor(y_test$y))
+
+cm_sgb_train <- confusionMatrix(factor(predict(model_sgb, newdata=X_train_balanced_over)), factor(y_train_balanced_over$y))
+
+```
+
+
+
+
+```{r performance}
+
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_error_rate_train <- 1-cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_test <- cm_pra_test[["byClass"]][["Balanced Accuracy"]]
+
+roc_pra <- roc(response = ttest$yb, predictor=as.numeric(pred_pra))
+plot(roc_pra, col="red", lwd=3, main="ROC curve PRA")
+auc_pra <-auc(roc_pra)
+#roc.curve(ttest$yb, as.numeric(pred_pra), plotit = F)
+
+```
+
+
+```{r submit}
+
+# this part is main code
+subm_url = 'http://46.101.121.83'
+
+u_name = "Error_Loading"
+p_word = "UHAxWUfYKVZNQmgq"
+submit_now = TRUE
+
+username = u_name
+password = p_word
+
+
+token = get_token(username=u_name, password=p_word, url=subm_url)
+## this part is where you need to provide your prediction method/function or set of R codes
+## predictions=runif(2073) type double olduğu için çevirdim
+
+pred <- pred_RF
+
+pred_dummy <- mlr::createDummyFeatures(pred, pred, method="reference")
+frame <- as.matrix(pred_dummy)
+
+predictions <- frame
+
+send_submission(predictions, token, url=subm_url, submit_now= submit_now)
+```
+
+# Related Literature
+Summarize relevant literature if there is any
+# Approach
+Explain your approach to this problem.
+# Results
+Provide your results and discussion.
+# Conclusions and Future Work
+Summarize your findings and comments regarding your
+approach. What are possible extensions to have a better approach?
+# Code
+The Github link for the codes is (HERE)[].
+
+
+
+
+
+# PRA
+
+# RF
+

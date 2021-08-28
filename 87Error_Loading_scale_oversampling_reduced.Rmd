@@ -1,0 +1,320 @@
+---
+title: "Project_582"
+author: "Error_Loading"
+date: "1/26/2021"
+output: 
+  html_document:
+      toc: true
+      toc_depth: 3
+      number_sections: true
+      code_folding: hide
+          
+---
+
+train_raw %>% group_by(y) %>% summarize(count=n()) 
+1565 a
+509 b
+
+DMwR::SMOTE: k=5, perc.over = 200, perc.under=200
+2036 a
+1527 b
+Aşağıdaki modeller bunu kullanıyor
+smotefamily::SMOTE
+
+PRA test 84, train 81 seed70
+RF 90-98, subm0.841
+RF2 90test-99train 0.84subm
+DT 84-84
+SGB 88 -100 no tune, 89-90 tune with gbmGrid_forever, 82 subm
+82-81 "svmLinear" 
+88-95 "svmRadial" subm76
+NN 85-93, subm 81.2
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, conflict=FALSE, warning=FALSE, message=FALSE, error = FALSE, comment = FALSE)
+```
+
+# Introduction
+Problem description, summary of the proposed approach, descriptive
+analysis of the given data.
+
+```{r submission_functions_dont_touch}
+require(jsonlite)
+require(httr)
+require(data.table)
+
+get_token <- function(username, password, url_site){
+    
+    post_body = list(username=username,password=password)
+    post_url_string = paste0(url_site,'/token/')
+    result = POST(post_url_string, body = post_body)
+
+    # error handling (wrong credentials)
+    if(result$status_code==400){
+        print('Check your credentials')
+        return(0)
+    }
+    else if (result$status_code==201){
+        output = content(result)
+        token = output$key
+    }
+
+    return(token)
+}
+
+send_submission <- function(predictions, token, url_site, submit_now=F){
+    
+    format_check=check_format(predictions)
+    if(!format_check){
+        return(FALSE)
+    }
+    
+    post_string="list("
+    for(i in 1:length(predictions)){
+        if(i<length(predictions)){
+            post_string=sprintf("%s%s,",post_string,predictions[i])
+        } else {
+            post_string=sprintf("%s%s)",post_string,predictions[i])
+        }
+    }
+    
+    submission = eval(parse(text=post_string))
+    json_body = jsonlite::toJSON(submission, auto_unbox = TRUE)
+    submission=list(submission=json_body)
+    print(submission)
+
+    if(!submit_now){
+        print("You did not submit.")
+        return(FALSE)      
+    }
+    
+
+    header = add_headers(c(Authorization=paste('Token',token,sep=' ')))
+    post_url_string = paste0(url_site,'/submission/')
+    result = POST(post_url_string, header, body=submission)
+    
+    if (result$status_code==201){
+        print("Successfully submitted. Below you can see the details of your submission")
+    } else {
+        print("Could not submit. Please check the error message below, contact the assistant if needed.")
+    }
+    
+    print(content(result))
+    
+}
+
+check_format <- function(predictions){
+    
+    if(all(is.numeric(predictions)) & all(predictions<=1)){
+        print("Format OK")
+        return(TRUE)
+    } else {
+        print("Wrong format")
+        return(FALSE)
+    }
+    
+}
+```
+
+
+```{r libraries}
+#importing the libraries
+library(caret)
+library(dplyr)
+library(corrplot)
+library(data.table)
+library(glmnet)
+library(rpart)
+library(TunePareto)
+library(randomForest)
+library(tidyverse)
+library(ggplot2)
+library(pROC)
+library(ROSE)
+library(nnet)
+library(skimr)
+```
+
+```{r dataset_manip}
+train_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTrain.csv?token=ANPOH4IJOQLOLAD4XZY5ODTAFOXIC")
+test_raw <- read.csv("https://raw.githubusercontent.com/ilaydacelenk/Error_Loading/master/IE582_Fall20_ProjectTest.csv?token=ANPOH4JMDTUCP6TB4RWTZSTAFOXFY")
+
+#skim(train_raw)
+
+#no NA values, good
+#train_raw %>% summarise_all(~ sum(is.na(.))) 
+#test_raw %>% summarise_all(~ sum(is.na(.))) 
+
+#to see the imbalance
+#train_raw %>% group_by(y) %>% summarize(count=n()) 
+#ggplot(train_raw, aes(x=y )) + geom_bar(color="blue", fill=rgb(0.1,0.4,0.5,0.7) )
+
+# train x50 ve x52 zero column, no variation, nothing to learn
+# test x50 ve x52 zero değil ama öğrenmediğini predict edemez
+# droplamak durumundayız
+train <- train_raw %>% select(-x50, -x52, x57, x37)
+X_test_submission <- test_raw %>% select(-x50, -x52, -x37, -x57, -y)
+
+# make all colns double for smote
+train_y <- mlr::createDummyFeatures(train$y, train$y,  method="reference")
+trainx <- train %>% select(-y)
+train <- cbind(as.data.table(trainx), as.data.table(train_y)) %>% rename(y=b)
+
+set.seed(70)
+smote <- smotefamily::SMOTE(X=train, target=train$y, K=1, dup_size = 2)
+
+final_train_smote <- smote[["data"]] %>% select(-class)
+#final_train_smote %>% group_by(y) %>% summarize(count=n()) 
+
+final_train_smote$y[final_train_smote$y==1] <- "b"
+final_train_smote$y[final_train_smote$y==0] <- "a"
+
+
+# cts olanlar ayrılıp scale edip cbind edilecek - X_test_submission ve train için, diğerleri factor yapılacak
+colns <- colnames(final_train_smote)
+cts_features <- c("x1", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x14", "x27", "x30", "x32", "x36", "x42")
+categorical_features <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x58", "x59", "x60")
+categorical_features_y <- c("x2", "x3", "x4", "x12", "x13", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x28", "x29", "x31", "x33", "x34", "x35", "x38", "x39", "x40", "x41", "x43", "x44", "x45", "x46", "x47", "x48", "x49", "x51", "x53", "x54", "x55", "x56", "x58", "x59", "x60", "y")
+
+# scaling
+train_cts_scaled <- final_train_smote %>% select(-y) %>% select(cts_features) %>% scale() %>% as.data.frame()
+
+X_test_cts_scaled <-X_test_submission %>% select(cts_features) %>% scale() %>% as.data.frame()
+
+# factorization
+train_categorical <- final_train_smote %>% select(categorical_features)
+train_categorical <- lapply(train_categorical, factor)
+X_test_submission_categorical <- X_test_submission %>% select(categorical_features)
+X_test_submission_categorical <- lapply(X_test_submission_categorical, factor)
+
+train_categorical <- final_train_smote %>% select(categorical_features)
+
+X_test_submission_categorical <- X_test_submission %>% select(categorical_features)
+
+# scaled and factored
+trainn <- cbind(as.data.table(train_cts_scaled), as.data.table(train_categorical), as.data.table(final_train_smote$y)) %>% rename(y=V1)
+#levels(trainn$y) <- c("a", "b")
+trainn$y <- as.factor(trainn$y)
+final_train <- trainn
+X_test_submission <- cbind(as.data.table(X_test_cts_scaled), as.data.table(X_test_submission_categorical))
+
+
+#Correlation check
+#corrplot(cor(train_cts_scaled, method = c("pearson")))
+#corrplot(cor(X_test_cts_scaled, method = c("pearson")))
+
+
+trainn <- final_train %>% select(-x59, -x26, -x49, -x46, -x43, -x60, -x29, -x55, -x31, -x18)
+
+set.seed(1)
+train_inds <- createDataPartition(y = 1:nrow(trainn), p = 0.8, list = F)
+test <- trainn[-train_inds, ]
+train <- trainn[train_inds, ]
+
+train <- train
+X_train <- train %>% select(-y)
+y_train <- train %>% select(y)
+X_test <- test %>% select(-y)
+y_test <- test %>% select(y)
+
+```
+
+```{r model}
+## RF 90-98 
+set.seed(50)
+m<-c(8, 10, 12, 15)
+#for balanced folds: stratified =TRUE
+# ntree is J=500 given in hw
+J<-500 
+# the minimal number of observations per tree leaf is nodesize 5 given in hw
+min_size_of_terminal_nodes<-5
+n_folds<-10
+fitControl<-trainControl(method = "repeatedcv", number = n_folds, repeats = 1, classProbs = TRUE, search="random", savePred=TRUE, summaryFunction = twoClassSummary)   
+rf_grid<-expand.grid(mtry = m)
+
+set.seed(50)
+model_RF <- train(y ~ ., data = train, method = "rf", trControl = fitControl, ntree=J, nodesize = min_size_of_terminal_nodes, tuneGrid = rf_grid, metric = "ROC")
+
+pred_RF <- predict(model_RF, newdata=X_test)
+
+cm_RF_test <- confusionMatrix(factor(pred_RF), factor(test$y))
+cm_RF_train <- confusionMatrix(factor(predict(model_RF, newdata=X_train)), factor(train$y))
+
+balanced_accuracy_test <- cm_RF_test[["byClass"]][["Balanced Accuracy"]]
+balanced_accuracy_train <- cm_RF_train[["byClass"]][["Balanced Accuracy"]]
+
+print(balanced_accuracy_test)
+print(balanced_accuracy_train)
+
+
+######  submission
+set.seed(50)
+m<-c(8, 10, 12)
+#for balanced folds: stratified =TRUE
+# ntree is J=500 given in hw
+J<-500 
+# the minimal number of observations per tree leaf is nodesize 5 given in hw
+min_size_of_terminal_nodes<-5
+n_folds<-10
+fitControl<-trainControl(method = "repeatedcv", number = n_folds, repeats = 1, classProbs = TRUE, search="random", savePred=TRUE, summaryFunction = twoClassSummary)   
+rf_grid<-expand.grid(mtry = m)
+model_RF <- train(y ~ ., data = trainn, method = "rf", trControl = fitControl, ntree=J, nodesize = min_size_of_terminal_nodes, tuneGrid = rf_grid, metric = "ROC")
+
+cm_pra_train <- confusionMatrix(factor(predict(model_RF, newdata=trainn[,-47])), factor(trainn$y))
+balanced_accuracy_train <- cm_pra_train[["byClass"]][["Balanced Accuracy"]]
+print(balanced_accuracy_train)
+
+pred_RF1 <- predict(model_RF, newdata=X_test_submission, type = 'prob')
+pred_RF <- pred_RF1[,2] #Bunu submitliyoruz
+
+
+a <- model_RF[["finalModel"]][["importance"]] %>% as.data.frame()
+colnames(a)[1] = "Importance"
+a <- a %>% arrange(desc(Importance))
+
+```
+
+
+
+
+
+```{r submit}
+# this part is main code
+subm_url = 'http://46.101.121.83'
+
+u_name = "Error_Loading"
+p_word = "UHAxWUfYKVZNQmgq"
+submit_now = TRUE
+
+username = u_name
+password = p_word
+
+token = get_token(username=u_name, password=p_word, url=subm_url)
+
+predictions <- pred_RF
+
+send_submission(predictions, token, url=subm_url, submit_now= submit_now)
+```
+
+# Related Literature
+Summarize relevant literature if there is any
+# Approach
+Explain your approach to this problem.
+# Results
+Provide your results and discussion.
+# Conclusions and Future Work
+Summarize your findings and comments regarding your
+approach. What are possible extensions to have a better approach?
+# Code
+The Github link for the codes is (HERE)[].
+
+
+
+
+
+# PRA
+
+# RF
+
